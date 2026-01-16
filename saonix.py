@@ -1,24 +1,23 @@
 # saonix.py
-# CustomTkinter + pynput
-# - Splash loader (no console), shows languages list
-# - GitHub version check (no re-download if same); icon uses ETag cache
-# - FULL global i18n: EN/RU/JA/PL/DE/ZH (all UI strings)
-# - No page animation (no "jerky transitions")
-# - Embedded icon download/cache to ProgramData\Saonix\app\icon.png (only updates when changed)
-#
-# Build without console (optional):
-# pyinstaller --noconsole --onefile saonix.py
+# Single-file: loader (GitHub update + cached downloads) + app (themes/glow/i18n/hotkeys/library/record)
+# Build without console: pyinstaller --noconsole --onefile --name Saonix saonix.py
 
 import os
 import sys
 import json
 import time
+import ctypes
+import queue
+import shutil
+import hashlib
+import zipfile
 import threading
 import traceback
-import ctypes
 import locale as pylocale
+import urllib.request
+import urllib.error
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Callable, Tuple
+from typing import Any, Dict, List, Optional, Callable
 
 import customtkinter as ctk
 from tkinter import messagebox, filedialog
@@ -28,727 +27,351 @@ from pynput.mouse import Button, Controller as MouseController
 from pynput.keyboard import Key, KeyCode, Controller as KeyboardController
 
 
-# =============================
-# App constants / GitHub
-# =============================
-APP_NAME = "Saonix"
-APP_VERSION = "1.0.0"
+# ============================================================
+# Update / Loader config
+# ============================================================
 
-# Remote version + icon (raw)
-GITHUB_VERSION_URL = "https://raw.githubusercontent.com/relberof/desktop-tutorial/69cec69713c6f91563ba3c2c87c6215042e67ee5/version.txt"
-GITHUB_ICON_URL = "https://raw.githubusercontent.com/relberof/desktop-tutorial/69cec69713c6f91563ba3c2c87c6215042e67ee5/icon.png"
+APP_NAME = "Saonix"
+
+# Put a manifest.json in your GitHub repo, example format:
+# {
+#   "version": "1.0.3",
+#   "bundle_url": "https://github.com/<user>/<repo>/releases/download/v1.0.3/saonix_bundle.zip",
+#   "bundle_sha256": "<optional sha256>",
+#   "notes": "optional"
+# }
+UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/relberof/desktop-tutorial/main/saonix_manifest.json"
+
+# Optional online icon (cached via ETag/Last-Modified, not re-downloaded if unchanged)
+ICON_PNG_URL = "https://raw.githubusercontent.com/relberof/desktop-tutorial/69cec69713c6f91563ba3c2c87c6215042e67ee5/icon.png"
 
 SUPPORT_DISCORD = "Relberof"
 
 
-# =============================
+# ============================================================
 # Paths
-# =============================
-def ensure_dir(p: str) -> str:
+# ============================================================
+
+def _ensure_dir(p: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
 
-
-def get_root_dir() -> str:
+def _writable_programdata_root() -> str:
     base = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
     root = os.path.join(base, APP_NAME)
     try:
-        ensure_dir(root)
-        t = os.path.join(root, "_rw.tmp")
-        with open(t, "w", encoding="utf-8") as f:
+        _ensure_dir(root)
+        test_path = os.path.join(root, "_rw_test.tmp")
+        with open(test_path, "w", encoding="utf-8") as f:
             f.write("ok")
-        os.remove(t)
+        os.remove(test_path)
         return root
     except Exception:
-        here = os.path.abspath(os.path.dirname(__file__)) if "__file__" in globals() else os.getcwd()
-        return ensure_dir(os.path.join(here, APP_NAME))
+        here = os.path.abspath(os.path.dirname(sys.argv[0] if sys.argv else __file__))
+        return _ensure_dir(os.path.join(here, APP_NAME))
+
+ROOT = _writable_programdata_root()
+DIR_APP = _ensure_dir(os.path.join(ROOT, "app"))
+DIR_DATA = _ensure_dir(os.path.join(ROOT, "data"))
+DIR_CACHE = _ensure_dir(os.path.join(ROOT, "cache"))
+DIR_LOGS = _ensure_dir(os.path.join(ROOT, "logs"))
+DIR_LOCALES = _ensure_dir(os.path.join(ROOT, "locales"))
+
+DB_FILE = os.path.join(DIR_DATA, "macros.json")
+SETTINGS_FILE = os.path.join(DIR_DATA, "settings.json")
+LOCAL_VERSION_FILE = os.path.join(DIR_DATA, "local_version.json")
+LOG_FILE = os.path.join(DIR_LOGS, "saonix.log")
+
+CACHED_MANIFEST_FILE = os.path.join(DIR_CACHE, "manifest_cached.json")
+CACHED_MANIFEST_META = os.path.join(DIR_CACHE, "manifest_meta.json")
+
+CACHED_ICON_FILE = os.path.join(DIR_CACHE, "icon.png")
+CACHED_ICON_META = os.path.join(DIR_CACHE, "icon_meta.json")
 
 
-ROOT = get_root_dir()
-DIR_APP = ensure_dir(os.path.join(ROOT, "app"))
-DIR_DATA = ensure_dir(os.path.join(ROOT, "data"))
-DIR_LOGS = ensure_dir(os.path.join(ROOT, "logs"))
-DIR_LOCALES = ensure_dir(os.path.join(ROOT, "locales"))
-
-DB_FILE = os.path.join(DIR_DATA, "macros_db.json")
-LOG_FILE = os.path.join(DIR_LOGS, "app.log")
-CRASH_FILE = os.path.join(DIR_LOGS, "crash_log.txt")
-CACHE_FILE = os.path.join(DIR_DATA, "net_cache.json")
-ICON_PNG = os.path.join(DIR_APP, "icon.png")
-
-
-# =============================
+# ============================================================
 # Utils
-# =============================
-def ts() -> str:
+# ============================================================
+
+def _ts() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
-
-def clamp(v, lo, hi):
+def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
-
-def safe_int(s: str, d: int) -> int:
+def _safe_int(s: Any, d: int) -> int:
     try:
         return int(str(s).strip())
     except Exception:
         return d
 
-
-def safe_float(s: str, d: float) -> float:
+def _safe_float(s: Any, d: float) -> float:
     try:
         return float(str(s).strip())
     except Exception:
         return d
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-def load_json(path: str, fallback: Any):
+def _atomic_write_json(path: str, data: Any):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+def _read_json(path: str, default: Any):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return fallback
+        return default
 
 
-def save_json(path: str, obj: Any):
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-    except Exception:
-        pass
-
-
-# =============================
+# ============================================================
 # Logger
-# =============================
+# ============================================================
+
 class Logger:
-    def __init__(self, ui_append: Optional[Callable[[str], None]] = None):
-        self.ui_append = ui_append
+    def __init__(self):
         self._lock = threading.Lock()
+        self._sink: Optional[Callable[[str], None]] = None
 
-    def _write_file(self, line: str):
-        try:
-            with open(LOG_FILE, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
-        except Exception:
-            pass
+    def set_sink(self, sink: Optional[Callable[[str], None]]):
+        self._sink = sink
 
-    def _log(self, lvl: str, msg: str):
-        line = f"[{ts()}] [{lvl}] {msg}"
+    def _write(self, level: str, msg: str):
+        line = f"[{_ts()}] [{level}] {msg}"
         with self._lock:
-            self._write_file(line)
+            try:
+                with open(LOG_FILE, "a", encoding="utf-8") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
         try:
-            if self.ui_append:
-                self.ui_append(line + "\n")
+            if self._sink:
+                self._sink(line + "\n")
         except Exception:
             pass
 
-    def info(self, m: str): self._log("INFO", m)
-    def warn(self, m: str): self._log("WARN", m)
-    def error(self, m: str): self._log("ERROR", m)
+    def info(self, msg: str): self._write("INFO", msg)
+    def warn(self, msg: str): self._write("WARN", msg)
+    def error(self, msg: str): self._write("ERROR", msg)
+
+log = Logger()
 
 
-# =============================
-# Language guess
-# =============================
-def system_lang_guess() -> str:
+# ============================================================
+# Locale / i18n
+# ============================================================
+
+def _system_lang_guess() -> str:
+    # Windows UI language (preferred)
     try:
         lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage()
         primary = lang_id & 0x3FF
         mapping_primary = {
-            0x09: "en",
-            0x19: "ru",
-            0x07: "de",
-            0x15: "pl",
-            0x11: "ja",
-            0x04: "zh",
+            0x19: "ru",  # Russian
+            0x09: "en",  # English
         }
-        base = mapping_primary.get(primary)
-        if base:
-            return base
+        v = mapping_primary.get(primary)
+        if v:
+            return v
     except Exception:
         pass
 
     try:
         loc = pylocale.getdefaultlocale()[0] or ""
-        loc = loc.replace("_", "-")
-        if loc:
-            return loc.split("-")[0].lower()
+        loc = loc.split("_")[0].lower()
+        if loc in ("ru", "en"):
+            return loc
     except Exception:
         pass
-
     return "en"
 
-
-# =============================
-# i18n (FULL GLOBAL)
-# =============================
 class I18N:
-    SUPPORTED = ["en", "ru", "ja", "pl", "de", "zh"]
+    SUPPORTED = ["en", "ru"]
 
-    # Full key set must exist in EN. Other languages can override all keys.
-    BUILTIN: Dict[str, Dict[str, str]] = {
-        "en": {
-            "app_title": "Saonix",
-            "support": f"Problems / questions / suggestions — Discord: {SUPPORT_DISCORD}",
+    EN = {
+        "app_title": "Saonix",
+        "nav_record": "● Record",
+        "nav_library": "📚 Library",
+        "nav_settings": "⚙ Settings",
+        "status_ready": "Ready",
+        "status_recording": "● Recording…",
+        "status_playing": "▶ Playing…",
+        "style": "Style",
+        "theme": "Theme",
+        "theme_dark": "Dark",
+        "theme_light": "Light",
+        "glow": "Glow",
+        "language": "Language",
+        "support": "Support",
+        "support_text": "Questions / issues / suggestions:\nDiscord: Relberof",
 
-            "loader_title": "Starting Saonix…",
-            "loader_langs": "Languages: English, Русский, 日本語, Polski, Deutsch, 中文",
-            "loader_step_version": "Checking version…",
-            "loader_step_icon": "Checking icon…",
-            "loader_step_ready": "Launching UI…",
+        "page_record": "Record",
+        "page_library": "Library",
+        "page_settings": "Settings",
 
-            "nav_record": "● Record",
-            "nav_library": "📚 Library",
-            "nav_settings": "⚙ Settings",
+        "rec_controls": "Controls",
+        "rec_start": "● Start recording",
+        "rec_stop": "■ Stop recording",
+        "rec_play_loaded": "▶ Play loaded",
+        "rec_stop_play": "⏹ Stop",
+        "rec_save_label": "Save to library:",
+        "rec_save_btn": "💾 Save",
+        "rec_clear_log": "Clear log (window)",
+        "rec_tips": "Tips",
 
-            "status_ready": "Ready",
-            "status_recording": "● Recording…",
-            "status_playing": "▶ Playing…",
+        "lib_title": "Library",
+        "search_ph": "Search…",
+        "btn_load": "Load",
+        "btn_delete": "Delete",
+        "btn_rename": "Rename",
+        "btn_clone": "Clone",
+        "btn_export": "Export JSON",
+        "btn_import": "Import JSON",
+        "bind": "Bind:",
+        "bind_ph": "F6 or Ctrl+Alt+F6",
+        "bind_set": "Set",
+        "bind_remove": "Remove",
+        "play_selected": "▶ Play selected",
 
-            "record_title": "Record",
-            "rec_start": "● Start recording",
-            "rec_stop": "■ Stop recording",
-            "rec_play": "▶ Play",
-            "rec_stop_play": "⏹ Stop",
-            "rec_save": "💾 Save",
-            "rec_save_label": "Save name:",
-            "rec_events": "Events:",
-            "rec_hint": "Tip: set hotkeys in Settings.",
+        "settings_playback": "Playback",
+        "repeat": "Repeat (times)",
+        "loop": "Loop (sec, 0=off)",
+        "speed": "Speed",
+        "delay": "Start delay (sec)",
+        "apply": "Apply",
+        "reset": "Reset",
+        "base_hotkeys": "Base hotkeys",
+        "hk_rec": "Start record",
+        "hk_stoprec": "Stop record",
+        "hk_play": "Play loaded",
+        "hk_stop": "Stop playing",
+        "hk_apply": "Apply hotkeys",
 
-            "library_title": "Library",
-            "search_ph": "Search…",
-            "btn_load": "Load",
-            "btn_delete": "Delete",
-            "btn_rename": "Rename",
-            "btn_clone": "Clone",
-            "btn_export": "Export JSON",
-            "btn_import": "Import JSON",
-            "btn_play_selected": "▶ Play selected",
+        "save_name_warn": "Enter macro name.",
+        "no_events_warn": "No events. Record a macro first.",
+        "overwrite_q": "Macro exists. Overwrite?",
+        "select_macro_warn": "Select a macro.",
+        "delete_q": "Delete macro?",
+        "invalid_hotkey": "Invalid hotkey. Example: F6 or Ctrl+Alt+F6",
 
-            "settings_title": "Settings",
-            "appearance": "Appearance",
-            "theme_dark": "Dark",
-            "theme_light": "Light",
-            "language": "Language",
+        "empty": "(empty)",
+        "binds_none": "(no binds)",
+        "saved": "Saved",
+        "loaded": "Loaded",
+        "deleted": "Deleted",
+        "renamed": "Renamed",
+        "cloned": "Cloned",
+        "imported": "Imported",
+        "exported": "Exported",
+    }
 
-            "playback": "Playback",
-            "repeat": "Repeat (times)",
-            "loop": "Loop (sec)",
-            "speed": "Speed",
-            "delay": "Start delay (sec)",
-            "apply": "Apply",
-            "reset": "Reset",
+    RU = {
+        "app_title": "Saonix",
+        "nav_record": "● Запись",
+        "nav_library": "📚 Библиотека",
+        "nav_settings": "⚙ Настройки",
+        "status_ready": "Готово",
+        "status_recording": "● Запись…",
+        "status_playing": "▶ Воспроизведение…",
+        "style": "Стиль",
+        "theme": "Тема",
+        "theme_dark": "Тёмная",
+        "theme_light": "Светлая",
+        "glow": "Glow",
+        "language": "Язык",
+        "support": "Поддержка",
+        "support_text": "Вопросы / проблемы / предложения:\nDiscord: Relberof",
 
-            "hotkeys": "Hotkeys",
-            "hk_rec": "Start record",
-            "hk_stoprec": "Stop record",
-            "hk_play": "Play loaded",
-            "hk_stop": "Stop playing",
-            "hk_apply": "Apply hotkeys",
+        "page_record": "Запись",
+        "page_library": "Библиотека",
+        "page_settings": "Настройки",
 
-            "binds_title": "Binds",
-            "bind": "Bind:",
-            "bind_ph": "F6 or Ctrl+Alt+F6",
-            "bind_set": "Set",
-            "bind_remove": "Remove",
-            "binds_none": "(no binds)",
+        "rec_controls": "Управление",
+        "rec_start": "● Начать запись",
+        "rec_stop": "■ Остановить запись",
+        "rec_play_loaded": "▶ Запустить (загруженный)",
+        "rec_stop_play": "⏹ Остановить",
+        "rec_save_label": "Сохранить в библиотеку:",
+        "rec_save_btn": "💾 Сохранить",
+        "rec_clear_log": "Очистить лог (в окне)",
+        "rec_tips": "Подсказки",
 
-            "dialogs_title": "Saonix",
-            "save_name_warn": "Enter macro name.",
-            "no_events_warn": "No events. Record a macro first.",
-            "overwrite_q": "Macro already exists. Overwrite?",
-            "select_macro_warn": "Select a macro.",
-            "delete_q": "Delete macro?",
-            "rename_prompt": "New name:",
-            "clone_prompt": "Clone name:",
-            "invalid_hotkey": "Invalid hotkey format. Example: F6 or Ctrl+Alt+F6",
-            "import_ok": "Imported.",
-            "export_ok": "Exported.",
-            "saved": "Saved",
-            "loaded": "Loaded",
-            "deleted": "Deleted",
-            "renamed": "Renamed",
-            "cloned": "Cloned",
-            "error": "Error",
-            "empty": "(empty)",
-            "preview": "Preview",
-            "version_line": "Version",
-            "remote_line": "Remote",
-            "update_available": "Update available.",
-        },
-        "ru": {
-            "app_title": "Saonix",
-            "support": f"Проблемы / вопросы / предложения — Discord: {SUPPORT_DISCORD}",
+        "lib_title": "Библиотека",
+        "search_ph": "Поиск…",
+        "btn_load": "Загрузить",
+        "btn_delete": "Удалить",
+        "btn_rename": "Переименовать",
+        "btn_clone": "Клонировать",
+        "btn_export": "Экспорт JSON",
+        "btn_import": "Импорт JSON",
+        "bind": "Бинд:",
+        "bind_ph": "F6 или Ctrl+Alt+F6",
+        "bind_set": "Назначить",
+        "bind_remove": "Снять",
+        "play_selected": "▶ Запустить выбранный",
 
-            "loader_title": "Запуск Saonix…",
-            "loader_langs": "Языки: English, Русский, 日本語, Polski, Deutsch, 中文",
-            "loader_step_version": "Проверка версии…",
-            "loader_step_icon": "Проверка иконки…",
-            "loader_step_ready": "Запуск интерфейса…",
+        "settings_playback": "Воспроизведение",
+        "repeat": "Повтор (раз)",
+        "loop": "Цикл (сек, 0=выкл)",
+        "speed": "Скорость",
+        "delay": "Задержка старта (сек)",
+        "apply": "Применить",
+        "reset": "Сброс",
+        "base_hotkeys": "Базовые хоткеи",
+        "hk_rec": "Старт записи",
+        "hk_stoprec": "Стоп записи",
+        "hk_play": "Пуск загруженного",
+        "hk_stop": "Стоп воспроизведения",
+        "hk_apply": "Применить хоткеи",
 
-            "nav_record": "● Запись",
-            "nav_library": "📚 Библиотека",
-            "nav_settings": "⚙ Настройки",
+        "save_name_warn": "Введи имя макроса.",
+        "no_events_warn": "Нет событий. Сначала запиши макрос.",
+        "overwrite_q": "Макрос уже существует. Перезаписать?",
+        "select_macro_warn": "Выбери макрос.",
+        "delete_q": "Удалить макрос?",
+        "invalid_hotkey": "Неверный формат. Пример: F6 или Ctrl+Alt+F6",
 
-            "status_ready": "Готово",
-            "status_recording": "● Запись…",
-            "status_playing": "▶ Воспроизведение…",
-
-            "record_title": "Запись",
-            "rec_start": "● Начать запись",
-            "rec_stop": "■ Остановить запись",
-            "rec_play": "▶ Воспроизвести",
-            "rec_stop_play": "⏹ Остановить",
-            "rec_save": "💾 Сохранить",
-            "rec_save_label": "Имя сохранения:",
-            "rec_events": "События:",
-            "rec_hint": "Подсказка: хоткеи в Настройках.",
-
-            "library_title": "Библиотека",
-            "search_ph": "Поиск…",
-            "btn_load": "Загрузить",
-            "btn_delete": "Удалить",
-            "btn_rename": "Переименовать",
-            "btn_clone": "Клонировать",
-            "btn_export": "Экспорт JSON",
-            "btn_import": "Импорт JSON",
-            "btn_play_selected": "▶ Воспроизвести выбранный",
-
-            "settings_title": "Настройки",
-            "appearance": "Тема",
-            "theme_dark": "Тёмная",
-            "theme_light": "Светлая",
-            "language": "Язык",
-
-            "playback": "Воспроизведение",
-            "repeat": "Повтор (раз)",
-            "loop": "Цикл (сек)",
-            "speed": "Скорость",
-            "delay": "Задержка старта (сек)",
-            "apply": "Применить",
-            "reset": "Сброс",
-
-            "hotkeys": "Хоткеи",
-            "hk_rec": "Старт записи",
-            "hk_stoprec": "Стоп записи",
-            "hk_play": "Пуск загруженного",
-            "hk_stop": "Стоп воспроизведения",
-            "hk_apply": "Применить хоткеи",
-
-            "binds_title": "Бинды",
-            "bind": "Бинд:",
-            "bind_ph": "F6 или Ctrl+Alt+F6",
-            "bind_set": "Назначить",
-            "bind_remove": "Снять",
-            "binds_none": "(биндов нет)",
-
-            "dialogs_title": "Saonix",
-            "save_name_warn": "Введи имя макроса.",
-            "no_events_warn": "Нет событий. Сначала запиши макрос.",
-            "overwrite_q": "Макрос уже существует. Перезаписать?",
-            "select_macro_warn": "Выбери макрос.",
-            "delete_q": "Удалить макрос?",
-            "rename_prompt": "Новое имя:",
-            "clone_prompt": "Имя копии:",
-            "invalid_hotkey": "Неверный формат. Пример: F6 или Ctrl+Alt+F6",
-            "import_ok": "Импортировано.",
-            "export_ok": "Экспортировано.",
-            "saved": "Сохранено",
-            "loaded": "Загружено",
-            "deleted": "Удалено",
-            "renamed": "Переименовано",
-            "cloned": "Клонировано",
-            "error": "Ошибка",
-            "empty": "(пусто)",
-            "preview": "Предпросмотр",
-            "version_line": "Версия",
-            "remote_line": "Удалённая",
-            "update_available": "Доступно обновление.",
-        },
-        "ja": {
-            "app_title": "Saonix",
-            "support": f"問題 / 質問 / 提案 — Discord: {SUPPORT_DISCORD}",
-
-            "loader_title": "Saonix を起動中…",
-            "loader_langs": "Languages: English, Русский, 日本語, Polski, Deutsch, 中文",
-            "loader_step_version": "バージョン確認中…",
-            "loader_step_icon": "アイコン確認中…",
-            "loader_step_ready": "UI を起動中…",
-
-            "nav_record": "● 記録",
-            "nav_library": "📚 ライブラリ",
-            "nav_settings": "⚙ 設定",
-
-            "status_ready": "準備完了",
-            "status_recording": "● 記録中…",
-            "status_playing": "▶ 再生中…",
-
-            "record_title": "記録",
-            "rec_start": "● 記録開始",
-            "rec_stop": "■ 記録停止",
-            "rec_play": "▶ 再生",
-            "rec_stop_play": "⏹ 停止",
-            "rec_save": "💾 保存",
-            "rec_save_label": "保存名:",
-            "rec_events": "イベント:",
-            "rec_hint": "ヒント: ホットキーは設定で変更できます。",
-
-            "library_title": "ライブラリ",
-            "search_ph": "検索…",
-            "btn_load": "読み込み",
-            "btn_delete": "削除",
-            "btn_rename": "名前変更",
-            "btn_clone": "複製",
-            "btn_export": "JSON 書き出し",
-            "btn_import": "JSON 読み込み",
-            "btn_play_selected": "▶ 選択を再生",
-
-            "settings_title": "設定",
-            "appearance": "外観",
-            "theme_dark": "ダーク",
-            "theme_light": "ライト",
-            "language": "言語",
-
-            "playback": "再生",
-            "repeat": "繰り返し(回)",
-            "loop": "ループ(秒)",
-            "speed": "速度",
-            "delay": "開始遅延(秒)",
-            "apply": "適用",
-            "reset": "リセット",
-
-            "hotkeys": "ホットキー",
-            "hk_rec": "記録開始",
-            "hk_stoprec": "記録停止",
-            "hk_play": "読み込みを再生",
-            "hk_stop": "再生停止",
-            "hk_apply": "ホットキー適用",
-
-            "binds_title": "割り当て",
-            "bind": "キー割り当て:",
-            "bind_ph": "F6 または Ctrl+Alt+F6",
-            "bind_set": "設定",
-            "bind_remove": "解除",
-            "binds_none": "(なし)",
-
-            "dialogs_title": "Saonix",
-            "save_name_warn": "マクロ名を入力してください。",
-            "no_events_warn": "イベントがありません。まず記録してください。",
-            "overwrite_q": "同名マクロがあります。上書きしますか？",
-            "select_macro_warn": "マクロを選択してください。",
-            "delete_q": "マクロを削除しますか？",
-            "rename_prompt": "新しい名前:",
-            "clone_prompt": "複製名:",
-            "invalid_hotkey": "ホットキー形式が無効です。例: F6 または Ctrl+Alt+F6",
-            "import_ok": "読み込み完了。",
-            "export_ok": "書き出し完了。",
-            "saved": "保存しました",
-            "loaded": "読み込みました",
-            "deleted": "削除しました",
-            "renamed": "変更しました",
-            "cloned": "複製しました",
-            "error": "エラー",
-            "empty": "(空)",
-            "preview": "プレビュー",
-            "version_line": "バージョン",
-            "remote_line": "リモート",
-            "update_available": "更新があります。",
-        },
-        "pl": {
-            "app_title": "Saonix",
-            "support": f"Problemy / pytania / propozycje — Discord: {SUPPORT_DISCORD}",
-
-            "loader_title": "Uruchamianie Saonix…",
-            "loader_langs": "Languages: English, Русский, 日本語, Polski, Deutsch, 中文",
-            "loader_step_version": "Sprawdzanie wersji…",
-            "loader_step_icon": "Sprawdzanie ikony…",
-            "loader_step_ready": "Uruchamianie UI…",
-
-            "nav_record": "● Nagrywanie",
-            "nav_library": "📚 Biblioteka",
-            "nav_settings": "⚙ Ustawienia",
-
-            "status_ready": "Gotowe",
-            "status_recording": "● Nagrywanie…",
-            "status_playing": "▶ Odtwarzanie…",
-
-            "record_title": "Nagrywanie",
-            "rec_start": "● Start nagrywania",
-            "rec_stop": "■ Stop nagrywania",
-            "rec_play": "▶ Odtwórz",
-            "rec_stop_play": "⏹ Zatrzymaj",
-            "rec_save": "💾 Zapisz",
-            "rec_save_label": "Nazwa zapisu:",
-            "rec_events": "Zdarzenia:",
-            "rec_hint": "Wskazówka: hotkeye ustawisz w Ustawieniach.",
-
-            "library_title": "Biblioteka",
-            "search_ph": "Szukaj…",
-            "btn_load": "Wczytaj",
-            "btn_delete": "Usuń",
-            "btn_rename": "Zmień nazwę",
-            "btn_clone": "Klonuj",
-            "btn_export": "Eksport JSON",
-            "btn_import": "Import JSON",
-            "btn_play_selected": "▶ Odtwórz zaznaczone",
-
-            "settings_title": "Ustawienia",
-            "appearance": "Wygląd",
-            "theme_dark": "Ciemny",
-            "theme_light": "Jasny",
-            "language": "Język",
-
-            "playback": "Odtwarzanie",
-            "repeat": "Powtórz (razy)",
-            "loop": "Pętla (sek)",
-            "speed": "Szybkość",
-            "delay": "Opóźnienie startu (sek)",
-            "apply": "Zastosuj",
-            "reset": "Resetuj",
-
-            "hotkeys": "Hotkeye",
-            "hk_rec": "Start nagrywania",
-            "hk_stoprec": "Stop nagrywania",
-            "hk_play": "Odtwórz wczytane",
-            "hk_stop": "Zatrzymaj odtwarzanie",
-            "hk_apply": "Zastosuj hotkeye",
-
-            "binds_title": "Skróty",
-            "bind": "Skrót:",
-            "bind_ph": "F6 lub Ctrl+Alt+F6",
-            "bind_set": "Ustaw",
-            "bind_remove": "Usuń",
-            "binds_none": "(brak)",
-
-            "dialogs_title": "Saonix",
-            "save_name_warn": "Wpisz nazwę makra.",
-            "no_events_warn": "Brak zdarzeń. Najpierw nagraj makro.",
-            "overwrite_q": "Makro już istnieje. Nadpisać?",
-            "select_macro_warn": "Wybierz makro.",
-            "delete_q": "Usunąć makro?",
-            "rename_prompt": "Nowa nazwa:",
-            "clone_prompt": "Nazwa klonu:",
-            "invalid_hotkey": "Zły format skrótu. Przykład: F6 lub Ctrl+Alt+F6",
-            "import_ok": "Zaimportowano.",
-            "export_ok": "Wyeksportowano.",
-            "saved": "Zapisano",
-            "loaded": "Wczytano",
-            "deleted": "Usunięto",
-            "renamed": "Zmieniono nazwę",
-            "cloned": "Sklonowano",
-            "error": "Błąd",
-            "empty": "(pusto)",
-            "preview": "Podgląd",
-            "version_line": "Wersja",
-            "remote_line": "Zdalna",
-            "update_available": "Dostępna aktualizacja.",
-        },
-        "de": {
-            "app_title": "Saonix",
-            "support": f"Probleme / Fragen / Vorschläge — Discord: {SUPPORT_DISCORD}",
-
-            "loader_title": "Saonix wird gestartet…",
-            "loader_langs": "Languages: English, Русский, 日本語, Polski, Deutsch, 中文",
-            "loader_step_version": "Version wird geprüft…",
-            "loader_step_icon": "Icon wird geprüft…",
-            "loader_step_ready": "UI wird gestartet…",
-
-            "nav_record": "● Aufnahme",
-            "nav_library": "📚 Bibliothek",
-            "nav_settings": "⚙ Einstellungen",
-
-            "status_ready": "Bereit",
-            "status_recording": "● Aufnahme…",
-            "status_playing": "▶ Wiedergabe…",
-
-            "record_title": "Aufnahme",
-            "rec_start": "● Aufnahme starten",
-            "rec_stop": "■ Aufnahme stoppen",
-            "rec_play": "▶ Abspielen",
-            "rec_stop_play": "⏹ Stop",
-            "rec_save": "💾 Speichern",
-            "rec_save_label": "Name speichern:",
-            "rec_events": "Ereignisse:",
-            "rec_hint": "Tipp: Hotkeys in Einstellungen setzen.",
-
-            "library_title": "Bibliothek",
-            "search_ph": "Suchen…",
-            "btn_load": "Laden",
-            "btn_delete": "Löschen",
-            "btn_rename": "Umbenennen",
-            "btn_clone": "Klonen",
-            "btn_export": "JSON exportieren",
-            "btn_import": "JSON importieren",
-            "btn_play_selected": "▶ Auswahl abspielen",
-
-            "settings_title": "Einstellungen",
-            "appearance": "Darstellung",
-            "theme_dark": "Dunkel",
-            "theme_light": "Hell",
-            "language": "Sprache",
-
-            "playback": "Wiedergabe",
-            "repeat": "Wiederholen (Anzahl)",
-            "loop": "Schleife (Sek)",
-            "speed": "Geschwindigkeit",
-            "delay": "Startverzögerung (Sek)",
-            "apply": "Anwenden",
-            "reset": "Zurücksetzen",
-
-            "hotkeys": "Hotkeys",
-            "hk_rec": "Aufnahme starten",
-            "hk_stoprec": "Aufnahme stoppen",
-            "hk_play": "Geladenes abspielen",
-            "hk_stop": "Wiedergabe stoppen",
-            "hk_apply": "Hotkeys anwenden",
-
-            "binds_title": "Belegungen",
-            "bind": "Belegung:",
-            "bind_ph": "F6 oder Ctrl+Alt+F6",
-            "bind_set": "Setzen",
-            "bind_remove": "Entfernen",
-            "binds_none": "(keine)",
-
-            "dialogs_title": "Saonix",
-            "save_name_warn": "Makronamen eingeben.",
-            "no_events_warn": "Keine Ereignisse. Zuerst aufnehmen.",
-            "overwrite_q": "Makro existiert bereits. Überschreiben?",
-            "select_macro_warn": "Makro auswählen.",
-            "delete_q": "Makro löschen?",
-            "rename_prompt": "Neuer Name:",
-            "clone_prompt": "Klonname:",
-            "invalid_hotkey": "Ungültiges Hotkey-Format. Beispiel: F6 oder Ctrl+Alt+F6",
-            "import_ok": "Importiert.",
-            "export_ok": "Exportiert.",
-            "saved": "Gespeichert",
-            "loaded": "Geladen",
-            "deleted": "Gelöscht",
-            "renamed": "Umbenannt",
-            "cloned": "Geklont",
-            "error": "Fehler",
-            "empty": "(leer)",
-            "preview": "Vorschau",
-            "version_line": "Version",
-            "remote_line": "Remote",
-            "update_available": "Update verfügbar.",
-        },
-        "zh": {
-            "app_title": "Saonix",
-            "support": f"问题 / 咨询 / 建议 — Discord: {SUPPORT_DISCORD}",
-
-            "loader_title": "正在启动 Saonix…",
-            "loader_langs": "Languages: English, Русский, 日本語, Polski, Deutsch, 中文",
-            "loader_step_version": "正在检查版本…",
-            "loader_step_icon": "正在检查图标…",
-            "loader_step_ready": "正在启动界面…",
-
-            "nav_record": "● 录制",
-            "nav_library": "📚 库",
-            "nav_settings": "⚙ 设置",
-
-            "status_ready": "就绪",
-            "status_recording": "● 录制中…",
-            "status_playing": "▶ 播放中…",
-
-            "record_title": "录制",
-            "rec_start": "● 开始录制",
-            "rec_stop": "■ 停止录制",
-            "rec_play": "▶ 播放",
-            "rec_stop_play": "⏹ 停止",
-            "rec_save": "💾 保存",
-            "rec_save_label": "保存名称:",
-            "rec_events": "事件:",
-            "rec_hint": "提示：在设置里配置热键。",
-
-            "library_title": "库",
-            "search_ph": "搜索…",
-            "btn_load": "加载",
-            "btn_delete": "删除",
-            "btn_rename": "重命名",
-            "btn_clone": "克隆",
-            "btn_export": "导出 JSON",
-            "btn_import": "导入 JSON",
-            "btn_play_selected": "▶ 播放所选",
-
-            "settings_title": "设置",
-            "appearance": "外观",
-            "theme_dark": "深色",
-            "theme_light": "浅色",
-            "language": "语言",
-
-            "playback": "播放",
-            "repeat": "重复(次)",
-            "loop": "循环(秒)",
-            "speed": "速度",
-            "delay": "启动延迟(秒)",
-            "apply": "应用",
-            "reset": "重置",
-
-            "hotkeys": "热键",
-            "hk_rec": "开始录制",
-            "hk_stoprec": "停止录制",
-            "hk_play": "播放已加载",
-            "hk_stop": "停止播放",
-            "hk_apply": "应用热键",
-
-            "binds_title": "绑定",
-            "bind": "绑定:",
-            "bind_ph": "F6 或 Ctrl+Alt+F6",
-            "bind_set": "设置",
-            "bind_remove": "移除",
-            "binds_none": "(无)",
-
-            "dialogs_title": "Saonix",
-            "save_name_warn": "请输入宏名称。",
-            "no_events_warn": "没有事件。请先录制宏。",
-            "overwrite_q": "宏已存在，是否覆盖？",
-            "select_macro_warn": "请选择宏。",
-            "delete_q": "删除宏？",
-            "rename_prompt": "新名称:",
-            "clone_prompt": "克隆名称:",
-            "invalid_hotkey": "热键格式无效。例：F6 或 Ctrl+Alt+F6",
-            "import_ok": "已导入。",
-            "export_ok": "已导出。",
-            "saved": "已保存",
-            "loaded": "已加载",
-            "deleted": "已删除",
-            "renamed": "已重命名",
-            "cloned": "已克隆",
-            "error": "错误",
-            "empty": "(空)",
-            "preview": "预览",
-            "version_line": "版本",
-            "remote_line": "远程",
-            "update_available": "有可用更新。",
-        },
+        "empty": "(пусто)",
+        "binds_none": "(биндов нет)",
+        "saved": "Сохранено",
+        "loaded": "Загружено",
+        "deleted": "Удалено",
+        "renamed": "Переименовано",
+        "cloned": "Клонировано",
+        "imported": "Импортировано",
+        "exported": "Экспортировано",
     }
 
     def __init__(self, lang: str):
         self.lang = "en"
-        self.dict: Dict[str, str] = {}
+        self.dict: Dict[str, str] = dict(self.EN)
         self.load(lang)
 
     def load(self, lang: str):
-        lang = (lang or "en").strip()
+        lang = (lang or "auto").strip().lower()
         if lang == "auto":
-            lang = system_lang_guess()
-
+            lang = _system_lang_guess()
         if lang not in self.SUPPORTED:
-            base = lang.split("-")[0].lower()
-            lang = base if base in self.SUPPORTED else "en"
+            lang = "en"
+        base = dict(self.EN)
+        if lang == "ru":
+            base.update(self.RU)
 
-        base = dict(self.BUILTIN["en"])
-        base.update(self.BUILTIN.get(lang, {}))
-
-        # Optional external override: locales/<lang>.json
+        # optional external override file locales/<lang>.json
         ext_path = os.path.join(DIR_LOCALES, f"{lang}.json")
         if os.path.exists(ext_path):
             try:
-                j = load_json(ext_path, {})
+                j = _read_json(ext_path, {})
                 if isinstance(j, dict):
-                    for k, v in j.items():
-                        base[str(k)] = str(v)
+                    base.update({str(k): str(v) for k, v in j.items()})
             except Exception:
                 pass
 
@@ -759,122 +382,164 @@ class I18N:
         return self.dict.get(key, key)
 
 
-# =============================
-# Net cache + downloader
-# =============================
-def _cache_get() -> Dict[str, Any]:
-    c = load_json(CACHE_FILE, {})
-    return c if isinstance(c, dict) else {}
+# ============================================================
+# Styles / themes / glow
+# ============================================================
+
+class StylePack:
+    def __init__(self, name: str, dark: Dict[str, str], light: Dict[str, str]):
+        self.name = name
+        self.dark = dark
+        self.light = light
+
+def style_get(pack: StylePack) -> Dict[str, str]:
+    return pack.dark if ctk.get_appearance_mode() == "Dark" else pack.light
+
+STYLES: Dict[str, StylePack] = {
+    "Calm": StylePack(
+        "Calm",
+        dark=dict(bg="#0d1118", panel="#121826", card="#141d2e",
+                  text="#e9eef7", muted="#a7b4cc",
+                  accent="#5aa7ff", accent2="#7c66ff",
+                  danger="#ff4a4a", border="#23314a"),
+        light=dict(bg="#f3f5f9", panel="#ffffff", card="#f7f9fc",
+                   text="#101828", muted="#475467",
+                   accent="#2563eb", accent2="#7c3aed",
+                   danger="#dc2626", border="#d0d5dd")
+    ),
+    "Aurora": StylePack(
+        "Aurora",
+        dark=dict(bg="#071216", panel="#0b1a20", card="#0d222a",
+                  text="#e9fffb", muted="#a3d6ce",
+                  accent="#49f1b8", accent2="#56a8ff",
+                  danger="#ff4a4a", border="#14343a"),
+        light=dict(bg="#f1fbfa", panel="#ffffff", card="#f6fffe",
+                   text="#06201e", muted="#1f6f67",
+                   accent="#0ea5e9", accent2="#22c55e",
+                   danger="#dc2626", border="#cde8e4")
+    ),
+    "Forest": StylePack(
+        "Forest",
+        dark=dict(bg="#0b120e", panel="#101a14", card="#132017",
+                  text="#eaf6ee", muted="#a7c2b1",
+                  accent="#34d399", accent2="#60a5fa",
+                  danger="#ff4a4a", border="#1f3327"),
+        light=dict(bg="#f3faf6", panel="#ffffff", card="#f7fff9",
+                   text="#0b1a12", muted="#335b45",
+                   accent="#059669", accent2="#2563eb",
+                   danger="#dc2626", border="#cfe7da")
+    ),
+    "Cherry": StylePack(
+        "Cherry",
+        dark=dict(bg="#130b10", panel="#1b1017", card="#23131d",
+                  text="#f7eaf1", muted="#d1b3c3",
+                  accent="#fb7185", accent2="#a78bfa",
+                  danger="#ff4a4a", border="#3a2230"),
+        light=dict(bg="#fff5f8", panel="#ffffff", card="#fff7fb",
+                   text="#241018", muted="#7c2d45",
+                   accent="#e11d48", accent2="#7c3aed",
+                   danger="#dc2626", border="#f3c6d6")
+    ),
+}
 
 
-def _cache_set(c: Dict[str, Any]):
-    save_json(CACHE_FILE, c)
+# ============================================================
+# DB
+# ============================================================
+
+class MacroDB:
+    def __init__(self, path: str):
+        self.path = path
+        self.data = {"version": 1, "macros": {}, "binds": {}, "settings": {}}
+        self.load()
+
+    def load(self):
+        if not os.path.exists(self.path):
+            return
+        d = _read_json(self.path, None)
+        if isinstance(d, dict):
+            self.data.update(d)
+            self.data.setdefault("macros", {})
+            self.data.setdefault("binds", {})
+            self.data.setdefault("settings", {})
+
+    def save(self):
+        _atomic_write_json(self.path, self.data)
+
+    def names(self) -> List[str]:
+        return sorted(self.data["macros"].keys(), key=lambda x: x.lower())
+
+    def exists(self, name: str) -> bool:
+        return name in self.data["macros"]
+
+    def get(self, name: str):
+        return self.data["macros"].get(name)
+
+    def put(self, name: str, events: List[dict], settings: Dict[str, Any]):
+        self.data["macros"][name] = {
+            "created": int(time.time()),
+            "events": events,
+            "settings": settings
+        }
+        self.save()
+
+    def delete(self, name: str):
+        if name in self.data["macros"]:
+            del self.data["macros"][name]
+        dead = [hk for hk, mn in self.data["binds"].items() if mn == name]
+        for hk in dead:
+            del self.data["binds"][hk]
+        self.save()
+
+    def rename(self, old: str, new: str) -> bool:
+        if old not in self.data["macros"]:
+            return False
+        if new in self.data["macros"]:
+            return False
+        self.data["macros"][new] = self.data["macros"].pop(old)
+        for hk, mn in list(self.data["binds"].items()):
+            if mn == old:
+                self.data["binds"][hk] = new
+        self.save()
+        return True
+
+    def clone(self, src: str, dst: str) -> bool:
+        if src not in self.data["macros"] or dst in self.data["macros"]:
+            return False
+        self.data["macros"][dst] = json.loads(json.dumps(self.data["macros"][src]))
+        self.data["macros"][dst]["created"] = int(time.time())
+        self.save()
+        return True
+
+    def binds(self) -> Dict[str, str]:
+        return dict(self.data.get("binds", {}))
+
+    def set_bind(self, hk: str, macro: str):
+        self.data.setdefault("binds", {})
+        self.data["binds"][hk] = macro
+        self.save()
+
+    def remove_bind(self, hk: str):
+        if hk in self.data.get("binds", {}):
+            del self.data["binds"][hk]
+            self.save()
+
+    def get_settings(self) -> Dict[str, Any]:
+        return dict(self.data.get("settings", {}))
+
+    def set_settings(self, s: Dict[str, Any]):
+        self.data["settings"] = dict(s)
+        self.save()
 
 
-def http_get_text(url: str, timeout: float = 6.0) -> Optional[str]:
-    try:
-        import urllib.request
-        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = r.read()
-        return data.decode("utf-8", errors="replace").strip()
-    except Exception:
-        return None
-
-
-def http_get_bytes(url: str, timeout: float = 8.0, etag_key: Optional[str] = None) -> Tuple[Optional[bytes], str]:
-    """
-    Returns (data, status):
-      - (None, "not_modified") if 304
-      - (bytes, "ok") if downloaded
-      - (None, "error") on error
-    """
-    try:
-        import urllib.request
-        import urllib.error
-
-        c = _cache_get()
-        headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
-        if etag_key:
-            etag = c.get(f"etag:{etag_key}")
-            if etag:
-                headers["If-None-Match"] = etag
-
-        req = urllib.request.Request(url, headers=headers)
-
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                code = getattr(r, "status", 200)
-                if code == 304:
-                    return None, "not_modified"
-                et = r.headers.get("ETag")
-                if etag_key and et:
-                    c[f"etag:{etag_key}"] = et
-                    _cache_set(c)
-                return r.read(), "ok"
-        except urllib.error.HTTPError as e:
-            if e.code == 304:
-                return None, "not_modified"
-            return None, "error"
-        except Exception:
-            return None, "error"
-    except Exception:
-        return None, "error"
-
-
-def ensure_icon_png(progress: Optional[Callable[[float], None]] = None) -> str:
-    ensure_dir(DIR_APP)
-
-    c = _cache_get()
-    last_url = c.get("icon_url")
-    if last_url != GITHUB_ICON_URL:
-        c.pop("etag:icon", None)
-        c["icon_url"] = GITHUB_ICON_URL
-        _cache_set(c)
-
-    if os.path.exists(ICON_PNG):
-        if progress:
-            progress(0.55)
-        data, status = http_get_bytes(GITHUB_ICON_URL, etag_key="icon")
-        if status == "not_modified":
-            return ICON_PNG
-        if isinstance(data, (bytes, bytearray)) and len(data) > 100:
-            try:
-                with open(ICON_PNG, "wb") as f:
-                    f.write(data)
-            except Exception:
-                pass
-        return ICON_PNG
-
-    if progress:
-        progress(0.55)
-    data, status = http_get_bytes(GITHUB_ICON_URL, etag_key="icon")
-    if isinstance(data, (bytes, bytearray)) and len(data) > 100:
-        try:
-            with open(ICON_PNG, "wb") as f:
-                f.write(data)
-        except Exception:
-            pass
-    return ICON_PNG
-
-
-def check_remote_version(progress: Optional[Callable[[float], None]] = None) -> Dict[str, Any]:
-    if progress:
-        progress(0.25)
-    remote = http_get_text(GITHUB_VERSION_URL)
-    if not remote:
-        return {"ok": True, "remote": None, "update": False}
-    remote = remote.strip()
-    return {"ok": True, "remote": remote, "update": (remote != APP_VERSION)}
-
-
-# =============================
+# ============================================================
 # Hotkey parsing
-# =============================
+# ============================================================
+
 def normalize_hotkey(text: str) -> Optional[str]:
     if not text:
         return None
-    t = text.strip().lower().replace(" ", "")
+    t = str(text).strip().lower().replace(" ", "")
     if not t:
         return None
     t = t.replace("<", "").replace(">", "")
@@ -885,7 +550,7 @@ def normalize_hotkey(text: str) -> Optional[str]:
             return f"<f{n}>"
 
     parts = t.split("+")
-    mods = []
+    mods: List[str] = []
     key = None
     for p in parts:
         if p in ("ctrl", "control"):
@@ -908,11 +573,13 @@ def normalize_hotkey(text: str) -> Optional[str]:
             key_fmt = f"<f{n}>"
         else:
             return None
-    elif len(key) == 1 and (key.isdigit() or ("a" <= key <= "z")):
+    elif len(key) == 1 and key.isdigit():
+        key_fmt = key
+    elif len(key) == 1 and ("a" <= key <= "z"):
         key_fmt = key
     elif key in ("space", "spc"):
         key_fmt = "<space>"
-    elif key in ("tab",):
+    elif key == "tab":
         key_fmt = "<tab>"
     elif key in ("esc", "escape"):
         key_fmt = "<esc>"
@@ -922,109 +589,16 @@ def normalize_hotkey(text: str) -> Optional[str]:
     return "+".join(mods + [key_fmt])
 
 
-# =============================
-# DB
-# =============================
-class MacroDB:
-    def __init__(self, path: str):
-        self.path = path
-        self.data = {"version": 5, "macros": {}, "binds": {}, "settings": {}}
-        self.load()
+# ============================================================
+# Macro engine (no key suppression)
+# ============================================================
 
-    def load(self):
-        if not os.path.exists(self.path):
-            return
-        d = load_json(self.path, None)
-        if isinstance(d, dict):
-            self.data.update(d)
-            self.data.setdefault("macros", {})
-            self.data.setdefault("binds", {})
-            self.data.setdefault("settings", {})
-
-    def save(self):
-        save_json(self.path, self.data)
-
-    def names(self) -> List[str]:
-        return sorted(self.data.get("macros", {}).keys(), key=lambda x: x.lower())
-
-    def exists(self, name: str) -> bool:
-        return name in self.data.get("macros", {})
-
-    def get(self, name: str):
-        return self.data.get("macros", {}).get(name)
-
-    def put(self, name: str, events: List[dict], settings: Dict[str, Any]):
-        self.data.setdefault("macros", {})
-        self.data["macros"][name] = {
-            "created": int(time.time()),
-            "events": events,
-            "settings": settings
-        }
-        self.save()
-
-    def delete(self, name: str):
-        if name in self.data.get("macros", {}):
-            del self.data["macros"][name]
-        dead = [hk for hk, mn in self.data.get("binds", {}).items() if mn == name]
-        for hk in dead:
-            del self.data["binds"][hk]
-        self.save()
-
-    def rename(self, old: str, new: str) -> bool:
-        if old not in self.data.get("macros", {}):
-            return False
-        if new in self.data.get("macros", {}):
-            return False
-        self.data["macros"][new] = self.data["macros"].pop(old)
-        for hk, mn in list(self.data.get("binds", {}).items()):
-            if mn == old:
-                self.data["binds"][hk] = new
-        self.save()
-        return True
-
-    def clone(self, src: str, dst: str) -> bool:
-        if src not in self.data.get("macros", {}):
-            return False
-        if dst in self.data.get("macros", {}):
-            return False
-        self.data["macros"][dst] = json.loads(json.dumps(self.data["macros"][src]))
-        self.data["macros"][dst]["created"] = int(time.time())
-        self.save()
-        return True
-
-    def binds(self) -> Dict[str, str]:
-        b = self.data.get("binds", {})
-        return dict(b) if isinstance(b, dict) else {}
-
-    def set_bind(self, hk: str, macro: str):
-        self.data.setdefault("binds", {})
-        self.data["binds"][hk] = macro
-        self.save()
-
-    def remove_bind(self, hk: str):
-        if hk in self.data.get("binds", {}):
-            del self.data["binds"][hk]
-            self.save()
-
-    def get_settings(self) -> Dict[str, Any]:
-        s = self.data.get("settings", {})
-        return s if isinstance(s, dict) else {}
-
-    def set_settings(self, s: Dict[str, Any]):
-        self.data["settings"] = dict(s)
-        self.save()
-
-
-# =============================
-# Engine
-# =============================
 @dataclass
 class Event:
     t: float
     device: str
     type: str
     data: Dict[str, Any]
-
 
 class MacroEngine:
     def __init__(self, logger: Logger):
@@ -1047,17 +621,17 @@ class MacroEngine:
         self._mouse_listener = mouse.Listener(
             on_move=self._on_move,
             on_click=self._on_click,
-            on_scroll=self._on_scroll,
+            on_scroll=self._on_scroll
         )
         self._kb_listener = keyboard.Listener(
             on_press=self._on_press,
             on_release=self._on_release,
-            suppress=False,
+            suppress=False
         )
 
         self._mouse_listener.start()
         self._kb_listener.start()
-        self.log.info("Engine ready")
+        self.log.info("Engine ready.")
 
     def shutdown(self):
         try: self._mouse_listener.stop()
@@ -1079,20 +653,20 @@ class MacroEngine:
     def start_recording(self):
         with self._play_lock:
             if self.playing:
-                self.log.warn("Cannot record while playing")
+                self.log.warn("Cannot record while playing.")
                 return
             if self.recording:
                 return
             self.events = []
             self._t0 = self.now()
             self.recording = True
-            self.log.info("Recording started")
+            self.log.info("=== Recording started ===")
 
     def stop_recording(self):
         if not self.recording:
             return
         self.recording = False
-        self.log.info(f"Recording stopped. Events={len(self.events)}")
+        self.log.info(f"=== Recording stopped. Events: {len(self.events)} ===")
 
     def stop_playing(self):
         with self._play_lock:
@@ -1100,7 +674,7 @@ class MacroEngine:
                 return
             self._stop_play.set()
             self.playing = False
-            self.log.info("Playback stopped")
+            self.log.info("=== Stopped ===")
 
     def _key_to_repr(self, k):
         if isinstance(k, Key):
@@ -1144,7 +718,7 @@ class MacroEngine:
         self._add("mouse", "click", {
             "x": int(x), "y": int(y),
             "button": button.name if hasattr(button, "name") else str(button),
-            "pressed": bool(pressed),
+            "pressed": bool(pressed)
         })
 
     def _on_scroll(self, x, y, dx, dy):
@@ -1193,7 +767,13 @@ class MacroEngine:
 
     def play(self, repeat: int, loop_seconds: int, speed: float, start_delay: float):
         with self._play_lock:
-            if self.recording or self.playing or not self.events:
+            if self.recording:
+                self.log.warn("Stop recording first.")
+                return
+            if self.playing:
+                return
+            if not self.events:
+                self.log.warn("No events.")
                 return
 
             self.playing = True
@@ -1242,9 +822,10 @@ class MacroEngine:
             threading.Thread(target=run, daemon=True).start()
 
 
-# =============================
-# Hotkeys
-# =============================
+# ============================================================
+# Hotkey manager
+# ============================================================
+
 class HotkeyManager:
     def __init__(self, logger: Logger):
         self.log = logger
@@ -1272,132 +853,399 @@ class HotkeyManager:
             pass
 
 
-# =============================
-# Splash loader (GUI)
-# =============================
-class Splash(ctk.CTkToplevel):
-    def __init__(self, master, i18n: I18N, png_path: Optional[str] = None):
-        super().__init__(master)
-        self.i18n = i18n
-        self.overrideredirect(True)
-        self.attributes("-topmost", True)
+# ============================================================
+# GitHub updater (manifest + bundle) with caching (ETag/Last-Modified)
+# ============================================================
 
-        ctk.set_appearance_mode("Dark")
-        self.configure(fg_color="#0b0f16")
+def _http_get(url: str, headers: Dict[str, str], timeout: int = 15):
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    return urllib.request.urlopen(req, timeout=timeout)
 
-        w, h = 640, 360
-        sw = self.winfo_screenwidth()
-        sh = self.winfo_screenheight()
-        x = (sw - w) // 2
-        y = (sh - h) // 2
-        self.geometry(f"{w}x{h}+{x}+{y}")
+def _http_read_json(url: str, cache_body_path: str, cache_meta_path: str) -> Dict[str, Any]:
+    meta = _read_json(cache_meta_path, {})
+    headers = {"User-Agent": f"{APP_NAME}/1.0"}
+    etag = meta.get("etag")
+    last = meta.get("last_modified")
+    if etag:
+        headers["If-None-Match"] = etag
+    if last:
+        headers["If-Modified-Since"] = last
 
-        self.card = ctk.CTkFrame(self, corner_radius=26)
-        self.card.pack(fill="both", expand=True, padx=18, pady=18)
-        self.card.grid_columnconfigure(0, weight=1)
+    try:
+        with _http_get(url, headers=headers, timeout=15) as resp:
+            code = getattr(resp, "status", 200)
+            if code == 304:
+                cached = _read_json(cache_body_path, {})
+                return cached if isinstance(cached, dict) else {}
+            body = resp.read().decode("utf-8", errors="replace")
+            data = json.loads(body) if body else {}
+            if isinstance(data, dict):
+                _atomic_write_json(cache_body_path, data)
+            new_meta = {
+                "etag": resp.headers.get("ETag"),
+                "last_modified": resp.headers.get("Last-Modified"),
+                "fetched_at": int(time.time())
+            }
+            _atomic_write_json(cache_meta_path, new_meta)
+            return data if isinstance(data, dict) else {}
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            cached = _read_json(cache_body_path, {})
+            return cached if isinstance(cached, dict) else {}
+        cached = _read_json(cache_body_path, {})
+        return cached if isinstance(cached, dict) else {}
+    except Exception:
+        cached = _read_json(cache_body_path, {})
+        return cached if isinstance(cached, dict) else {}
 
-        self._img_ref = None
-        if png_path and os.path.exists(png_path):
-            try:
-                import tkinter as tk
-                img = tk.PhotoImage(file=png_path)
-                self._img_ref = img
-                ctk.CTkLabel(self.card, text="", image=img).grid(row=0, column=0, pady=(26, 12))
-            except Exception:
-                pass
-
-        self.lbl_title = ctk.CTkLabel(self.card, text=self.i18n.t("loader_title"),
-                                      font=ctk.CTkFont(size=22, weight="bold"))
-        self.lbl_title.grid(row=1, column=0, pady=(0, 6))
-
-        self.lbl_langs = ctk.CTkLabel(self.card, text=self.i18n.t("loader_langs"))
-        self.lbl_langs.grid(row=2, column=0, pady=(0, 14))
-
-        self.status_var = ctk.StringVar(value=self.i18n.t("loader_step_version"))
-        self.lbl_status = ctk.CTkLabel(self.card, textvariable=self.status_var)
-        self.lbl_status.grid(row=3, column=0, pady=(0, 10))
-
-        self.pb = ctk.CTkProgressBar(self.card)
-        self.pb.grid(row=4, column=0, padx=48, pady=(0, 8), sticky="ew")
-        self.pb.set(0.02)
-
-        self.small = ctk.CTkLabel(self.card, text=self.i18n.t("support"), wraplength=540, justify="center")
-        self.small.grid(row=5, column=0, pady=(10, 22), padx=28)
-
-        self.update_idletasks()
-
-    def set_status(self, text: str, frac: float):
+def _http_download(url: str, dst: str, headers: Dict[str, str],
+                   on_progress: Optional[Callable[[int, int], None]] = None,
+                   timeout: int = 30) -> bool:
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            total = resp.headers.get("Content-Length")
+            total_i = int(total) if total and total.isdigit() else -1
+            _ensure_dir(os.path.dirname(dst))
+            tmp = dst + ".tmp"
+            got = 0
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if on_progress:
+                        on_progress(got, total_i)
+            os.replace(tmp, dst)
+        return True
+    except Exception:
         try:
-            self.status_var.set(text)
-            self.pb.set(clamp(float(frac), 0.02, 1.0))
-            self.update_idletasks()
+            if os.path.exists(dst + ".tmp"):
+                os.remove(dst + ".tmp")
         except Exception:
             pass
+        return False
 
-    def close(self):
+def _cached_download_with_meta(url: str, dst: str, meta_path: str,
+                               on_progress: Optional[Callable[[int, int], None]] = None) -> bool:
+    meta = _read_json(meta_path, {})
+    headers = {"User-Agent": f"{APP_NAME}/1.0"}
+    if meta.get("etag"):
+        headers["If-None-Match"] = meta["etag"]
+    if meta.get("last_modified"):
+        headers["If-Modified-Since"] = meta["last_modified"]
+
+    try:
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            code = getattr(resp, "status", 200)
+            if code == 304 and os.path.exists(dst):
+                return True
+
+            total = resp.headers.get("Content-Length")
+            total_i = int(total) if total and total.isdigit() else -1
+            _ensure_dir(os.path.dirname(dst))
+            tmp = dst + ".tmp"
+            got = 0
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = resp.read(64 * 1024)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    got += len(chunk)
+                    if on_progress:
+                        on_progress(got, total_i)
+            os.replace(tmp, dst)
+
+            new_meta = {
+                "etag": resp.headers.get("ETag"),
+                "last_modified": resp.headers.get("Last-Modified"),
+                "fetched_at": int(time.time())
+            }
+            _atomic_write_json(meta_path, new_meta)
+            return True
+
+    except urllib.error.HTTPError as e:
+        if e.code == 304 and os.path.exists(dst):
+            return True
+        return os.path.exists(dst)
+    except Exception:
+        return os.path.exists(dst)
+
+def _load_local_version() -> str:
+    d = _read_json(LOCAL_VERSION_FILE, {})
+    v = d.get("version")
+    return str(v) if v else ""
+
+def _save_local_version(v: str):
+    _atomic_write_json(LOCAL_VERSION_FILE, {"version": str(v), "updated_at": int(time.time())})
+
+def _extract_zip(zip_path: str, dst_dir: str):
+    tmp_dir = dst_dir + ".__new__"
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    _ensure_dir(tmp_dir)
+
+    with zipfile.ZipFile(zip_path, "r") as z:
+        z.extractall(tmp_dir)
+
+    # swap
+    backup = dst_dir + ".__old__"
+    if os.path.exists(backup):
+        shutil.rmtree(backup, ignore_errors=True)
+    if os.path.exists(dst_dir):
+        os.replace(dst_dir, backup)
+    os.replace(tmp_dir, dst_dir)
+    if os.path.exists(backup):
+        shutil.rmtree(backup, ignore_errors=True)
+
+def check_and_update(progress_cb: Callable[[float, str], None]) -> str:
+    """
+    Returns status string: "ok" / "offline" / "updated"
+    """
+    progress_cb(0.05, "Checking updates…")
+    manifest = _http_read_json(UPDATE_MANIFEST_URL, CACHED_MANIFEST_FILE, CACHED_MANIFEST_META)
+    if not manifest or not isinstance(manifest, dict):
+        progress_cb(0.25, "Offline mode (no manifest).")
+        return "offline"
+
+    remote_ver = str(manifest.get("version", "")).strip()
+    bundle_url = str(manifest.get("bundle_url", "")).strip()
+    bundle_sha = str(manifest.get("bundle_sha256", "")).strip().lower()
+
+    if not remote_ver or not bundle_url:
+        progress_cb(0.25, "Manifest invalid. Starting…")
+        return "offline"
+
+    local_ver = _load_local_version()
+    if local_ver == remote_ver and os.path.exists(DIR_APP):
+        progress_cb(0.35, f"No updates (v{remote_ver}).")
+        return "ok"
+
+    progress_cb(0.35, f"Downloading update (v{remote_ver})…")
+    zip_path = os.path.join(DIR_CACHE, f"bundle_{remote_ver}.zip")
+
+    def on_dl(got: int, total: int):
+        if total > 0:
+            p = 0.35 + 0.45 * (got / total)
+            progress_cb(p, f"Downloading… {int(100 * got / total)}%")
+        else:
+            progress_cb(0.55, "Downloading…")
+
+    ok = _http_download(bundle_url, zip_path, headers={"User-Agent": f"{APP_NAME}/1.0"}, on_progress=on_dl, timeout=60)
+    if not ok:
+        progress_cb(0.70, "Download failed. Starting…")
+        return "offline"
+
+    if bundle_sha and len(bundle_sha) >= 16:
+        progress_cb(0.82, "Verifying package…")
+        try:
+            got = _sha256_file(zip_path).lower()
+            if got != bundle_sha:
+                progress_cb(0.86, "Verification failed. Starting…")
+                return "offline"
+        except Exception:
+            progress_cb(0.86, "Verification failed. Starting…")
+            return "offline"
+
+    progress_cb(0.88, "Installing…")
+    try:
+        _extract_zip(zip_path, DIR_APP)
+    except Exception:
+        progress_cb(0.92, "Install failed. Starting…")
+        return "offline"
+
+    _save_local_version(remote_ver)
+    progress_cb(0.98, "Update installed. Starting…")
+    return "updated"
+
+
+# ============================================================
+# Icon handling (cached download + local load)
+# ============================================================
+
+def load_app_icon_photo(master: ctk.CTk) -> Optional[ctk.CTkImage]:
+    try:
+        # cache online icon once (ETag/Last-Modified)
+        def _p(_got, _total): pass
+        _cached_download_with_meta(ICON_PNG_URL, CACHED_ICON_FILE, CACHED_ICON_META, on_progress=_p)
+    except Exception:
+        pass
+
+    try:
+        if os.path.exists(CACHED_ICON_FILE):
+            img = ctk.CTkImage(light_image=None, dark_image=None, size=(64, 64))
+            # CTkImage wants PIL images normally; use Tk PhotoImage instead for iconphoto
+            return None
+    except Exception:
+        pass
+    return None
+
+def apply_window_icon(root: ctk.CTk):
+    # Tk iconphoto supports PNG via PhotoImage
+    try:
+        import tkinter as tk
+        path = CACHED_ICON_FILE if os.path.exists(CACHED_ICON_FILE) else None
+        if path:
+            photo = tk.PhotoImage(file=path)
+            root.iconphoto(True, photo)
+            root._saonix_icon_ref = photo  # keep ref
+    except Exception:
+        pass
+
+
+# ============================================================
+# Loader (splash)
+# ============================================================
+
+class Loader(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        ctk.set_appearance_mode("Dark")
+        self.title(APP_NAME)
+        self.geometry("520x260")
+        self.resizable(False, False)
+
+        apply_window_icon(self)
+
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self.wrap = ctk.CTkFrame(self, corner_radius=18)
+        self.wrap.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        self.wrap.grid_columnconfigure(0, weight=1)
+
+        self.lbl_title = ctk.CTkLabel(self.wrap, text=APP_NAME, font=ctk.CTkFont(size=28, weight="bold"))
+        self.lbl_title.grid(row=0, column=0, sticky="w", padx=18, pady=(18, 4))
+
+        self.lbl_sub = ctk.CTkLabel(self.wrap, text="Loading…", font=ctk.CTkFont(size=13))
+        self.lbl_sub.grid(row=1, column=0, sticky="w", padx=18, pady=(0, 10))
+
+        self.bar = ctk.CTkProgressBar(self.wrap)
+        self.bar.grid(row=2, column=0, sticky="ew", padx=18, pady=(6, 8))
+        self.bar.set(0.0)
+
+        self.lbl_status = ctk.CTkLabel(self.wrap, text="Starting…", justify="left")
+        self.lbl_status.grid(row=3, column=0, sticky="w", padx=18, pady=(6, 0))
+
+        self.lbl_support = ctk.CTkLabel(self.wrap, text=f"Support: Discord {SUPPORT_DISCORD}", font=ctk.CTkFont(size=12))
+        self.lbl_support.grid(row=4, column=0, sticky="w", padx=18, pady=(10, 18))
+
+        self._q: "queue.Queue[tuple]" = queue.Queue()
+        self._done = False
+        self._update_status = "ok"
+
+        threading.Thread(target=self._worker, daemon=True).start()
+        self.after(50, self._pump)
+
+    def _set_ui(self, p: float, status: str):
+        self.bar.set(_clamp(p, 0.0, 1.0))
+        self.lbl_status.configure(text=status)
+
+    def _worker(self):
+        try:
+            def progress_cb(p: float, msg: str):
+                self._q.put(("p", p, msg))
+            # cache icon once (no re-download if not changed)
+            self._q.put(("p", 0.02, "Preparing…"))
+            try:
+                _cached_download_with_meta(ICON_PNG_URL, CACHED_ICON_FILE, CACHED_ICON_META)
+            except Exception:
+                pass
+            self._update_status = check_and_update(progress_cb)
+            self._q.put(("done",))
+        except Exception:
+            self._q.put(("p", 0.30, "Starting…"))
+            self._q.put(("done",))
+
+    def _pump(self):
+        try:
+            while True:
+                item = self._q.get_nowait()
+                if not item:
+                    break
+                if item[0] == "p":
+                    _, p, msg = item
+                    self._set_ui(float(p), str(msg))
+                elif item[0] == "done":
+                    self._done = True
+        except queue.Empty:
+            pass
+
+        if self._done:
+            self.after(200, self._start_app)
+            return
+
+        self.after(50, self._pump)
+
+    def _start_app(self):
         try:
             self.destroy()
         except Exception:
             pass
+        run_app()
 
 
-# =============================
-# App UI
-# =============================
+# ============================================================
+# Main app
+# ============================================================
+
 class SaonixApp(ctk.CTk):
-    def __init__(self, i18n: I18N, boot_info: Dict[str, Any]):
+    def __init__(self):
         super().__init__()
-        self.i18n = i18n
-        self.boot_info = boot_info
 
         self.db = MacroDB(DB_FILE)
-
         saved = self.db.get_settings()
-        theme = saved.get("appearance", "Dark")
-        if theme not in ("Dark", "Light"):
-            theme = "Dark"
 
-        ctk.set_appearance_mode(theme)
-        ctk.set_default_color_theme(saved.get("color_theme", "dark-blue"))
+        # i18n
+        lang = str(saved.get("lang", "auto"))
+        self.i18n = I18N(lang)
 
-        self.title(self.i18n.t("app_title"))
-        self.geometry("1180x720")
-        self.minsize(1080, 640)
+        # appearance
+        appearance = saved.get("appearance", "Dark")
+        if appearance not in ("Dark", "Light"):
+            appearance = "Dark"
+        ctk.set_appearance_mode(appearance)
 
-        # icon
-        self._ico_ref = None
-        try:
-            if os.path.exists(ICON_PNG):
-                import tkinter as tk
-                img = tk.PhotoImage(file=ICON_PNG)
-                self.iconphoto(True, img)
-                self._ico_ref = img
-        except Exception:
-            pass
+        # style + glow
+        style_name = str(saved.get("style", "Calm"))
+        self.current_style = STYLES.get(style_name, STYLES["Calm"])
+        self.glow_var = ctk.IntVar(value=int(saved.get("glow", 2)))
 
-        self.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        self.log_box = None
-        self.logger = Logger(self._append_log_ui)
-        self.engine = MacroEngine(self.logger)
-        self.hk = HotkeyManager(self.logger)
-
-        # vars
+        # playback
         self.repeat_var = ctk.StringVar(value=str(saved.get("repeat", 1)))
         self.loop_var = ctk.StringVar(value=str(saved.get("loop_seconds", 0)))
         self.speed_var = ctk.StringVar(value=str(saved.get("speed", 1.0)))
         self.delay_var = ctk.StringVar(value=str(saved.get("start_delay", 0.0)))
 
+        # base hotkeys
         self.hk_rec_var = ctk.StringVar(value=str(saved.get("hk_rec", "Ctrl+Alt+1")))
         self.hk_stoprec_var = ctk.StringVar(value=str(saved.get("hk_stoprec", "Ctrl+Alt+2")))
         self.hk_play_var = ctk.StringVar(value=str(saved.get("hk_play", "Ctrl+Alt+3")))
         self.hk_stop_var = ctk.StringVar(value=str(saved.get("hk_stop", "Ctrl+Alt+4")))
 
+        self._active_page = "record"
         self.selected_macro: Optional[str] = None
+        self.macro_buttons: Dict[str, ctk.CTkButton] = {}
+
+        self.title(self.i18n.t("app_title"))
+        self.geometry("1180x720")
+        self.minsize(1080, 680)
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        apply_window_icon(self)
+
+        # logger -> UI
+        self.log_box: Optional[ctk.CTkTextbox] = None
+        log.set_sink(self._append_log_ui)
+
+        self.engine = MacroEngine(log)
+        self.hk = HotkeyManager(log)
 
         # layout
-        self._active_page = "record"
-
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
@@ -1406,36 +1254,56 @@ class SaonixApp(ctk.CTk):
         self.sidebar.grid_columnconfigure(0, weight=1)
         self.sidebar.grid_rowconfigure(99, weight=1)
 
-        self.lbl_brand = ctk.CTkLabel(self.sidebar, text="", font=ctk.CTkFont(size=26, weight="bold"))
-        self.lbl_brand.grid(row=0, column=0, padx=16, pady=(16, 4), sticky="w")
+        self.lbl_brand = ctk.CTkLabel(self.sidebar, text=self.i18n.t("app_title"),
+                                      font=ctk.CTkFont(family="Times New Roman", size=26, weight="bold"))
+        self.lbl_brand.grid(row=0, column=0, padx=16, pady=(16, 2), sticky="w")
 
-        self.btn_record = ctk.CTkButton(self.sidebar, text="", command=lambda: self.show_page("record"))
-        self.btn_library = ctk.CTkButton(self.sidebar, text="", command=lambda: self.show_page("library"))
-        self.btn_settings = ctk.CTkButton(self.sidebar, text="", command=lambda: self.show_page("settings"))
+        self.lbl_tag = ctk.CTkLabel(self.sidebar, text="Macro Recorder", font=ctk.CTkFont(size=14))
+        self.lbl_tag.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="w")
+
+        self.btn_record = ctk.CTkButton(self.sidebar, text=self.i18n.t("nav_record"),
+                                        command=lambda: self.show_page("record"))
+        self.btn_library = ctk.CTkButton(self.sidebar, text=self.i18n.t("nav_library"),
+                                         command=lambda: self.show_page("library"))
+        self.btn_settings = ctk.CTkButton(self.sidebar, text=self.i18n.t("nav_settings"),
+                                          command=lambda: self.show_page("settings"))
         self.btn_record.grid(row=2, column=0, padx=16, pady=8, sticky="ew")
         self.btn_library.grid(row=3, column=0, padx=16, pady=8, sticky="ew")
         self.btn_settings.grid(row=4, column=0, padx=16, pady=8, sticky="ew")
 
-        self.lbl_lang_title = ctk.CTkLabel(self.sidebar, text="", font=ctk.CTkFont(weight="bold"))
-        self.lbl_lang_title.grid(row=6, column=0, padx=16, pady=(18, 6), sticky="w")
+        self.lbl_style = ctk.CTkLabel(self.sidebar, text=self.i18n.t("style"), font=ctk.CTkFont(weight="bold"))
+        self.lbl_style.grid(row=6, column=0, padx=16, pady=(18, 4), sticky="w")
+        self.style_menu = ctk.CTkOptionMenu(self.sidebar, values=list(STYLES.keys()), command=self.set_style)
+        self.style_menu.set(style_name if style_name in STYLES else "Calm")
+        self.style_menu.grid(row=7, column=0, padx=16, pady=6, sticky="ew")
 
+        self.lbl_mode = ctk.CTkLabel(self.sidebar, text=self.i18n.t("theme"), font=ctk.CTkFont(weight="bold"))
+        self.lbl_mode.grid(row=8, column=0, padx=16, pady=(10, 4), sticky="w")
+        self.mode_menu = ctk.CTkOptionMenu(self.sidebar,
+                                           values=[self.i18n.t("theme_dark"), self.i18n.t("theme_light")],
+                                           command=self.set_mode)
+        self.mode_menu.set(self.i18n.t("theme_dark") if ctk.get_appearance_mode() == "Dark" else self.i18n.t("theme_light"))
+        self.mode_menu.grid(row=9, column=0, padx=16, pady=6, sticky="ew")
+
+        self.lbl_lang = ctk.CTkLabel(self.sidebar, text=self.i18n.t("language"), font=ctk.CTkFont(weight="bold"))
+        self.lbl_lang.grid(row=10, column=0, padx=16, pady=(10, 4), sticky="w")
         self.lang_menu = ctk.CTkOptionMenu(self.sidebar, values=["auto"] + I18N.SUPPORTED, command=self.set_lang)
-        self.lang_choice = saved.get("lang", "auto")
-        if self.lang_choice not in (["auto"] + I18N.SUPPORTED):
-            self.lang_choice = "auto"
-        self.lang_menu.set(self.lang_choice)
-        self.lang_menu.grid(row=7, column=0, padx=16, pady=(0, 10), sticky="ew")
+        self.lang_menu.set(lang if lang in (["auto"] + I18N.SUPPORTED) else "auto")
+        self.lang_menu.grid(row=11, column=0, padx=16, pady=6, sticky="ew")
 
-        self.lbl_theme_title = ctk.CTkLabel(self.sidebar, text="", font=ctk.CTkFont(weight="bold"))
-        self.lbl_theme_title.grid(row=8, column=0, padx=16, pady=(6, 6), sticky="w")
+        self.lbl_glow = ctk.CTkLabel(self.sidebar, text=self.i18n.t("glow"), font=ctk.CTkFont(weight="bold"))
+        self.lbl_glow.grid(row=12, column=0, padx=16, pady=(14, 4), sticky="w")
+        self.glow_slider = ctk.CTkSlider(self.sidebar, from_=0, to=3, number_of_steps=3, command=self._on_glow)
+        self.glow_slider.set(int(self.glow_var.get()))
+        self.glow_slider.grid(row=13, column=0, padx=16, pady=(0, 10), sticky="ew")
 
-        self.theme_menu = ctk.CTkOptionMenu(self.sidebar, values=["Dark", "Light"], command=self.set_theme)
-        self.theme_menu.set(theme)
-        self.theme_menu.grid(row=9, column=0, padx=16, pady=(0, 10), sticky="ew")
+        # support info (one time, bottom-left)
+        self.support_title = ctk.CTkLabel(self.sidebar, text=self.i18n.t("support"), font=ctk.CTkFont(weight="bold"))
+        self.support_title.grid(row=98, column=0, padx=16, pady=(0, 4), sticky="w")
+        self.support_text = ctk.CTkLabel(self.sidebar, text=self.i18n.t("support_text"), justify="left")
+        self.support_text.grid(row=99, column=0, padx=16, pady=(0, 14), sticky="sw")
 
-        self.support_lbl = ctk.CTkLabel(self.sidebar, text="", wraplength=220, justify="left")
-        self.support_lbl.grid(row=98, column=0, padx=16, pady=14, sticky="sw")
-
+        # main
         self.main = ctk.CTkFrame(self, corner_radius=18)
         self.main.grid(row=0, column=1, sticky="nsew", padx=(0, 14), pady=14)
         self.main.grid_rowconfigure(1, weight=1)
@@ -1445,10 +1313,10 @@ class SaonixApp(ctk.CTk):
         self.header.grid(row=0, column=0, sticky="ew", padx=14, pady=(14, 8))
         self.header.grid_columnconfigure(0, weight=1)
 
-        self.h_title = ctk.CTkLabel(self.header, text="", font=ctk.CTkFont(size=18, weight="bold"))
+        self.h_title = ctk.CTkLabel(self.header, text=self.i18n.t("page_record"), font=ctk.CTkFont(size=18, weight="bold"))
         self.h_title.grid(row=0, column=0, padx=14, pady=12, sticky="w")
 
-        self.status_var = ctk.StringVar(value="")
+        self.status_var = ctk.StringVar(value=self.i18n.t("status_ready"))
         self.h_status = ctk.CTkLabel(self.header, textvariable=self.status_var)
         self.h_status.grid(row=0, column=1, padx=14, pady=12, sticky="e")
 
@@ -1464,74 +1332,24 @@ class SaonixApp(ctk.CTk):
             p.grid(row=0, column=0, sticky="nsew")
             p.grid_remove()
 
-        self._widgets_i18n: List[Tuple[Any, str, str]] = []  # (widget, property, key)
-
+        # build
         self.build_record_page()
         self.build_library_page()
         self.build_settings_page()
 
+        self.apply_texts()
+        self.apply_style()
+
+        self.show_page("record")
         self.rebuild_hotkeys()
+
         self.after(200, self.tick)
 
-        self.apply_texts()  # sets all UI text from i18n
-        self.show_page("record")
+        log.info("Started.")
 
-        if self.boot_info.get("remote"):
-            if self.boot_info.get("update"):
-                self.logger.warn(f"Remote version {self.boot_info['remote']} available (local {APP_VERSION})")
-            else:
-                self.logger.info(f"Version OK: {APP_VERSION}")
-
-    def i_bind(self, widget, prop: str, key: str):
-        self._widgets_i18n.append((widget, prop, key))
-
-    def apply_texts(self):
-        # window + sidebar
-        self.title(self.i18n.t("app_title"))
-        self.lbl_brand.configure(text=self.i18n.t("app_title"))
-
-        self.btn_record.configure(text=self.i18n.t("nav_record"))
-        self.btn_library.configure(text=self.i18n.t("nav_library"))
-        self.btn_settings.configure(text=self.i18n.t("nav_settings"))
-
-        self.lbl_lang_title.configure(text=self.i18n.t("language"))
-        self.lbl_theme_title.configure(text=self.i18n.t("appearance"))
-
-        # theme names shown in menu should be localized, but values must remain Dark/Light internally
-        # keep menu values as Dark/Light, but label above is localized; it’s stable and avoids breakages.
-
-        self.support_lbl.configure(text=self.i18n.t("support"))
-
-        # pages / controls
-        for w, prop, key in self._widgets_i18n:
-            try:
-                txt = self.i18n.t(key)
-                if prop == "text":
-                    w.configure(text=txt)
-                elif prop == "placeholder":
-                    w.configure(placeholder_text=txt)
-            except Exception:
-                pass
-
-        # header title refresh
-        self.show_page(self._active_page)
-
-    def set_lang(self, lang: str):
-        s = self.db.get_settings()
-        s["lang"] = lang
-        self.db.set_settings(s)
-        self.i18n.load(lang)
-        self.apply_texts()
-        self.refresh_library()
-
-    def set_theme(self, theme: str):
-        if theme not in ("Dark", "Light"):
-            return
-        ctk.set_appearance_mode(theme)
-        s = self.db.get_settings()
-        s["appearance"] = theme
-        self.db.set_settings(s)
-
+    # ---------------------------
+    # Close
+    # ---------------------------
     def on_close(self):
         try:
             self.engine.stop_playing()
@@ -1547,6 +1365,9 @@ class SaonixApp(ctk.CTk):
             pass
         self.destroy()
 
+    # ---------------------------
+    # Log sink
+    # ---------------------------
     def _append_log_ui(self, text: str):
         try:
             if self.log_box is None:
@@ -1556,6 +1377,9 @@ class SaonixApp(ctk.CTk):
         except Exception:
             pass
 
+    # ---------------------------
+    # Tick / status
+    # ---------------------------
     def tick(self):
         if self.engine.recording:
             self.status_var.set(self.i18n.t("status_recording"))
@@ -1565,86 +1389,374 @@ class SaonixApp(ctk.CTk):
             self.status_var.set(self.i18n.t("status_ready"))
         self.after(200, self.tick)
 
+    # ---------------------------
+    # Persist settings
+    # ---------------------------
     def current_play_settings(self) -> Dict[str, Any]:
-        repeat = clamp(safe_int(self.repeat_var.get(), 1), 1, 9999)
-        loop_seconds = clamp(safe_int(self.loop_var.get(), 0), 0, 24 * 3600)
-        speed = clamp(safe_float(self.speed_var.get(), 1.0), 0.05, 5.0)
-        delay = clamp(safe_float(self.delay_var.get(), 0.0), 0.0, 60.0)
+        repeat = _clamp(_safe_int(self.repeat_var.get(), 1), 1, 9999)
+        loop_seconds = _clamp(_safe_int(self.loop_var.get(), 0), 0, 24 * 3600)
+        speed = _clamp(_safe_float(self.speed_var.get(), 1.0), 0.05, 5.0)
+        delay = _clamp(_safe_float(self.delay_var.get(), 0.0), 0.0, 60.0)
         return {"repeat": repeat, "loop_seconds": loop_seconds, "speed": speed, "start_delay": delay}
+
+    def apply_play_settings_to_ui(self, s: Dict[str, Any]):
+        self.repeat_var.set(str(s.get("repeat", 1)))
+        self.loop_var.set(str(s.get("loop_seconds", 0)))
+        self.speed_var.set(str(s.get("speed", 1.0)))
+        self.delay_var.set(str(s.get("start_delay", 0.0)))
 
     def persist_settings(self):
         s = self.db.get_settings()
-        s.update(self.current_play_settings())
         s.update({
+            "appearance": ctk.get_appearance_mode(),
+            "style": self.style_menu.get(),
             "lang": self.lang_menu.get(),
+            "glow": int(self.glow_var.get()),
             "hk_rec": self.hk_rec_var.get(),
             "hk_stoprec": self.hk_stoprec_var.get(),
             "hk_play": self.hk_play_var.get(),
             "hk_stop": self.hk_stop_var.get(),
         })
+        s.update(self.current_play_settings())
         self.db.set_settings(s)
 
+    # ---------------------------
+    # Theme/style/lang/glow
+    # ---------------------------
+    def set_style(self, name: str):
+        self.current_style = STYLES.get(name, STYLES["Calm"])
+        self.persist_settings()
+        self.apply_style()
+
+    def set_mode(self, mode_text: str):
+        if mode_text == self.i18n.t("theme_light"):
+            ctk.set_appearance_mode("Light")
+        else:
+            ctk.set_appearance_mode("Dark")
+        self.persist_settings()
+        self.apply_style()
+
+    def set_lang(self, lang: str):
+        self.i18n.load(lang)
+        self.title(self.i18n.t("app_title"))
+        # refresh option labels for theme menu
+        self.mode_menu.configure(values=[self.i18n.t("theme_dark"), self.i18n.t("theme_light")])
+        self.mode_menu.set(self.i18n.t("theme_dark") if ctk.get_appearance_mode() == "Dark" else self.i18n.t("theme_light"))
+        self.persist_settings()
+        self.apply_texts()
+
+    def _on_glow(self, _=None):
+        self.glow_var.set(int(round(self.glow_slider.get())))
+        self.persist_settings()
+        self.apply_style()
+
+    def apply_glow(self, frame: ctk.CTkFrame, active: bool = True):
+        lvl = int(self.glow_var.get())
+        col = style_get(self.current_style)["accent"]
+        if (not active) or lvl <= 0:
+            frame.configure(border_width=0)
+            return
+        frame.configure(border_width={1: 1, 2: 2, 3: 3}.get(lvl, 2), border_color=col)
+
+    def _style_nav_button(self, btn: ctk.CTkButton, active: bool):
+        s = style_get(self.current_style)
+        if active:
+            btn.configure(
+                fg_color=s["card"], hover_color=s["border"], text_color=s["text"],
+                border_width=2, border_color=s["accent"], corner_radius=14
+            )
+        else:
+            btn.configure(
+                fg_color=s["card"], hover_color=s["border"], text_color=s["text"],
+                border_width=0, corner_radius=14
+            )
+
+    def apply_style(self):
+        s = style_get(self.current_style)
+        self.configure(fg_color=s["bg"])
+        self.sidebar.configure(fg_color=s["panel"])
+        self.main.configure(fg_color=s["bg"])
+
+        self.lbl_brand.configure(text_color=s["text"])
+        self.lbl_tag.configure(text_color=s["muted"])
+
+        self.lbl_style.configure(text_color=s["text"])
+        self.lbl_mode.configure(text_color=s["text"])
+        self.lbl_lang.configure(text_color=s["text"])
+        self.lbl_glow.configure(text_color=s["text"])
+        self.support_title.configure(text_color=s["text"])
+        self.support_text.configure(text_color=s["muted"])
+
+        self.style_menu.configure(fg_color=s["card"], button_color=s["border"], button_hover_color=s["accent2"], text_color=s["text"])
+        self.mode_menu.configure(fg_color=s["card"], button_color=s["border"], button_hover_color=s["accent2"], text_color=s["text"])
+        self.lang_menu.configure(fg_color=s["card"], button_color=s["border"], button_hover_color=s["accent2"], text_color=s["text"])
+        self.glow_slider.configure(progress_color=s["accent"])
+
+        self._style_nav_button(self.btn_record, self._active_page == "record")
+        self._style_nav_button(self.btn_library, self._active_page == "library")
+        self._style_nav_button(self.btn_settings, self._active_page == "settings")
+
+        self.h_title.configure(text_color=s["text"])
+        self.h_status.configure(text_color=s["muted"])
+
+        # record
+        self.card_ctrl.configure(fg_color=s["card"])
+        self.card_tips.configure(fg_color=s["card"])
+        self.apply_glow(self.card_ctrl, True)
+        self.apply_glow(self.card_tips, True)
+
+        self.rec_title.configure(text_color=s["text"])
+        self.tips_title.configure(text_color=s["text"])
+        self.tips_text.configure(text_color=s["muted"])
+
+        self.btn_start.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"], border_width=2, border_color=s["accent"])
+        self.btn_stop.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"])
+        self.btn_play.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"], border_width=2, border_color=s["accent2"])
+        self.btn_stopplay.configure(fg_color=s["danger"], hover_color=s["danger"], text_color="#ffffff")
+        self.btn_save.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"], border_width=2, border_color=s["accent2"])
+
+        self.save_label.configure(text_color=s["muted"])
+        self.save_entry.configure(fg_color=s["panel"], text_color=s["text"], border_color=s["border"])
+
+        self.log_title.configure(text_color=s["text"])
+        self.log_box.configure(fg_color=s["panel"], text_color=s["text"])
+        self.btn_clear_log.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"], border_width=2, border_color=s["accent2"])
+
+        # library
+        self.lib_left.configure(fg_color=s["card"])
+        self.lib_right.configure(fg_color=s["card"])
+        self.apply_glow(self.lib_left, True)
+        self.apply_glow(self.lib_right, True)
+
+        self.lib_title.configure(text_color=s["text"])
+        self.search_entry.configure(fg_color=s["panel"], text_color=s["text"], border_color=s["border"])
+        self.macros_scroll.configure(fg_color=s["panel"])
+
+        self.preview_title.configure(text_color=s["text"])
+        self.preview_meta.configure(text_color=s["muted"])
+        self.preview_box.configure(fg_color=s["panel"], text_color=s["text"])
+
+        self.bind_label.configure(text_color=s["text"])
+        self.bind_entry.configure(fg_color=s["panel"], text_color=s["text"], border_color=s["border"])
+        self.binds_box.configure(fg_color=s["panel"], text_color=s["text"])
+
+        for b in [self.btn_load, self.btn_rename, self.btn_clone, self.btn_export, self.btn_import, self.btn_bind]:
+            b.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"], border_width=2, border_color=s["accent2"])
+        self.btn_delete.configure(fg_color=s["danger"], hover_color=s["danger"], text_color="#ffffff")
+        self.btn_unbind.configure(fg_color=s["danger"], hover_color=s["danger"], text_color="#ffffff")
+        self.btn_play_sel.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"], border_width=2, border_color=s["accent"])
+        self.btn_stop_sel.configure(fg_color=s["danger"], hover_color=s["danger"], text_color="#ffffff")
+
+        # settings
+        self.set_wrap.configure(fg_color=s["card"])
+        self.apply_glow(self.set_wrap, True)
+        self.set_title.configure(text_color=s["text"])
+        self.set_hint.configure(text_color=s["muted"])
+
+        for lab in self.set_labels:
+            lab.configure(text_color=s["text"])
+        for ent in self.set_entries:
+            ent.configure(fg_color=s["panel"], text_color=s["text"], border_color=s["border"])
+        for lab in self.hk_labels:
+            lab.configure(text_color=s["text"])
+        for ent in self.hk_entries:
+            ent.configure(fg_color=s["panel"], text_color=s["text"], border_color=s["border"])
+
+        self.btn_apply.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"], border_width=2, border_color=s["accent"])
+        self.btn_reset.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"], border_width=2, border_color=s["accent2"])
+        self.btn_apply_hotkeys.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"], border_width=2, border_color=s["accent2"])
+
+        self._restyle_macro_buttons()
+
+    # ---------------------------
+    # Texts
+    # ---------------------------
+    def apply_texts(self):
+        self.lbl_brand.configure(text=self.i18n.t("app_title"))
+        self.btn_record.configure(text=self.i18n.t("nav_record"))
+        self.btn_library.configure(text=self.i18n.t("nav_library"))
+        self.btn_settings.configure(text=self.i18n.t("nav_settings"))
+
+        self.lbl_style.configure(text=self.i18n.t("style"))
+        self.lbl_mode.configure(text=self.i18n.t("theme"))
+        self.lbl_lang.configure(text=self.i18n.t("language"))
+        self.lbl_glow.configure(text=self.i18n.t("glow"))
+
+        self.support_title.configure(text=self.i18n.t("support"))
+        self.support_text.configure(text=self.i18n.t("support_text"))
+
+        if self._active_page == "record":
+            self.h_title.configure(text=self.i18n.t("page_record"))
+        elif self._active_page == "library":
+            self.h_title.configure(text=self.i18n.t("page_library"))
+        else:
+            self.h_title.configure(text=self.i18n.t("page_settings"))
+
+        # record
+        self.rec_title.configure(text=self.i18n.t("rec_controls"))
+        self.btn_start.configure(text=self.i18n.t("rec_start"))
+        self.btn_stop.configure(text=self.i18n.t("rec_stop"))
+        self.btn_play.configure(text=self.i18n.t("rec_play_loaded"))
+        self.btn_stopplay.configure(text=self.i18n.t("rec_stop_play"))
+        self.save_label.configure(text=self.i18n.t("rec_save_label"))
+        self.btn_save.configure(text=self.i18n.t("rec_save_btn"))
+        self.log_title.configure(text="Log")
+        self.btn_clear_log.configure(text=self.i18n.t("rec_clear_log"))
+        self.tips_title.configure(text=self.i18n.t("rec_tips"))
+
+        # library
+        self.lib_title.configure(text=self.i18n.t("lib_title"))
+        self.search_entry.configure(placeholder_text=self.i18n.t("search_ph"))
+        self.btn_load.configure(text=self.i18n.t("btn_load"))
+        self.btn_delete.configure(text=self.i18n.t("btn_delete"))
+        self.btn_rename.configure(text=self.i18n.t("btn_rename"))
+        self.btn_clone.configure(text=self.i18n.t("btn_clone"))
+        self.btn_export.configure(text=self.i18n.t("btn_export"))
+        self.btn_import.configure(text=self.i18n.t("btn_import"))
+        self.bind_label.configure(text=self.i18n.t("bind"))
+        self.bind_entry.configure(placeholder_text=self.i18n.t("bind_ph"))
+        self.btn_bind.configure(text=self.i18n.t("bind_set"))
+        self.btn_unbind.configure(text=self.i18n.t("bind_remove"))
+        self.btn_play_sel.configure(text=self.i18n.t("play_selected"))
+        self.btn_stop_sel.configure(text=self.i18n.t("rec_stop_play"))
+
+        # settings
+        self.set_title.configure(text=self.i18n.t("settings_playback"))
+        self.btn_apply.configure(text=self.i18n.t("apply"))
+        self.btn_reset.configure(text=self.i18n.t("reset"))
+        self.hk_title.configure(text=self.i18n.t("base_hotkeys"))
+        self.btn_apply_hotkeys.configure(text=self.i18n.t("hk_apply"))
+
+        self.set_labels[0].configure(text=self.i18n.t("repeat"))
+        self.set_labels[1].configure(text=self.i18n.t("loop"))
+        self.set_labels[2].configure(text=self.i18n.t("speed"))
+        self.set_labels[3].configure(text=self.i18n.t("delay"))
+
+        self.hk_labels[0].configure(text=self.i18n.t("hk_rec"))
+        self.hk_labels[1].configure(text=self.i18n.t("hk_stoprec"))
+        self.hk_labels[2].configure(text=self.i18n.t("hk_play"))
+        self.hk_labels[3].configure(text=self.i18n.t("hk_stop"))
+
+        self.refresh_binds_box()
+        self.refresh_library()
+        self.preview_selected()
+        self.update_tip_text(force=True)
+
+    # ---------------------------
+    # Navigation (no animation)
+    # ---------------------------
     def show_page(self, which: str):
         self._active_page = which
         for p in (self.page_record, self.page_library, self.page_settings):
             p.grid_remove()
+
         if which == "record":
             self.page_record.grid()
-            self.h_title.configure(text=self.i18n.t("record_title"))
+            self.h_title.configure(text=self.i18n.t("page_record"))
         elif which == "library":
             self.page_library.grid()
-            self.h_title.configure(text=self.i18n.t("library_title"))
+            self.h_title.configure(text=self.i18n.t("page_library"))
         else:
             self.page_settings.grid()
-            self.h_title.configure(text=self.i18n.t("settings_title"))
+            self.h_title.configure(text=self.i18n.t("page_settings"))
 
-    # ---- Record page ----
+        self.apply_style()
+
+    # ---------------------------
+    # Record page + tips panel
+    # ---------------------------
     def build_record_page(self):
         self.page_record.grid_columnconfigure(0, weight=1)
         self.page_record.grid_columnconfigure(1, weight=1)
         self.page_record.grid_rowconfigure(2, weight=1)
 
-        card = ctk.CTkFrame(self.page_record, corner_radius=18)
-        card.grid(row=0, column=0, sticky="nsew", padx=(16, 10), pady=(16, 10))
+        self.card_ctrl = ctk.CTkFrame(self.page_record, corner_radius=18)
+        self.card_ctrl.grid(row=0, column=0, sticky="nsew", padx=(16, 10), pady=(16, 10))
 
-        row1 = ctk.CTkFrame(card, fg_color="transparent")
-        row1.pack(fill="x", padx=12, pady=(14, 6))
-        self.btn_start = ctk.CTkButton(row1, text="", command=self.engine.start_recording)
-        self.btn_stop = ctk.CTkButton(row1, text="", command=self.engine.stop_recording)
+        self.rec_title = ctk.CTkLabel(self.card_ctrl, text="Controls", font=ctk.CTkFont(size=16, weight="bold"))
+        self.rec_title.pack(anchor="w", padx=16, pady=(16, 8))
+
+        row1 = ctk.CTkFrame(self.card_ctrl, fg_color="transparent")
+        row1.pack(fill="x", padx=12, pady=6)
+
+        self.btn_start = ctk.CTkButton(row1, text="Start", command=self.engine.start_recording)
         self.btn_start.pack(side="left", padx=6)
+
+        self.btn_stop = ctk.CTkButton(row1, text="Stop", command=self.engine.stop_recording)
         self.btn_stop.pack(side="left", padx=6)
-        self.i_bind(self.btn_start, "text", "rec_start")
-        self.i_bind(self.btn_stop, "text", "rec_stop")
 
-        row2 = ctk.CTkFrame(card, fg_color="transparent")
+        row2 = ctk.CTkFrame(self.card_ctrl, fg_color="transparent")
         row2.pack(fill="x", padx=12, pady=6)
-        self.btn_play = ctk.CTkButton(row2, text="", command=self.play_from_ui)
-        self.btn_stopplay = ctk.CTkButton(row2, text="", command=self.engine.stop_playing)
-        self.btn_play.pack(side="left", padx=6)
-        self.btn_stopplay.pack(side="left", padx=6)
-        self.i_bind(self.btn_play, "text", "rec_play")
-        self.i_bind(self.btn_stopplay, "text", "rec_stop_play")
 
-        self.save_label = ctk.CTkLabel(card, text="")
+        self.btn_play = ctk.CTkButton(row2, text="Play", command=self.play_from_ui)
+        self.btn_play.pack(side="left", padx=6)
+
+        self.btn_stopplay = ctk.CTkButton(row2, text="Stop", command=self.engine.stop_playing)
+        self.btn_stopplay.pack(side="left", padx=6)
+
+        self.save_label = ctk.CTkLabel(self.card_ctrl, text="Save:", font=ctk.CTkFont(size=12))
         self.save_label.pack(anchor="w", padx=16, pady=(12, 4))
-        self.i_bind(self.save_label, "text", "rec_save_label")
 
         self.save_name = ctk.StringVar(value="New macro")
-        self.save_entry = ctk.CTkEntry(card, textvariable=self.save_name)
+        self.save_entry = ctk.CTkEntry(self.card_ctrl, textvariable=self.save_name)
         self.save_entry.pack(fill="x", padx=16, pady=6)
 
-        self.btn_save = ctk.CTkButton(card, text="", command=self.save_current_macro)
+        self.btn_save = ctk.CTkButton(self.card_ctrl, text="Save", command=self.save_current_macro)
         self.btn_save.pack(fill="x", padx=16, pady=(6, 16))
-        self.i_bind(self.btn_save, "text", "rec_save")
 
-        hint = ctk.CTkFrame(self.page_record, corner_radius=18)
-        hint.grid(row=0, column=1, sticky="nsew", padx=(10, 16), pady=(16, 10))
-        self.hint_text = ctk.CTkLabel(hint, text="", justify="left", wraplength=420)
-        self.hint_text.pack(anchor="w", padx=16, pady=16)
-        self.i_bind(self.hint_text, "text", "rec_hint")
+        # tips panel (right)
+        self.card_tips = ctk.CTkFrame(self.page_record, corner_radius=18)
+        self.card_tips.grid(row=0, column=1, sticky="nsew", padx=(10, 16), pady=(16, 10))
+
+        self.tips_title = ctk.CTkLabel(self.card_tips, text="Tips", font=ctk.CTkFont(size=16, weight="bold"))
+        self.tips_title.pack(anchor="w", padx=16, pady=(16, 8))
+
+        self.tips_text = ctk.CTkLabel(self.card_tips, text="", justify="left", wraplength=420)
+        self.tips_text.pack(anchor="w", padx=16, pady=(0, 16))
+
+        self._tips = [
+            lambda: ("Run as Admin if your game/app is Admin." if self.i18n.lang == "en"
+                     else "Запускай от Админа, если игра/программа запущена от Админа."),
+            lambda: ("Hotkeys: set in Settings → Base hotkeys." if self.i18n.lang == "en"
+                     else "Хоткеи: настраиваются в Настройки → Базовые хоткеи."),
+            lambda: (f"Support: Discord {SUPPORT_DISCORD}" if self.i18n.lang == "en"
+                     else f"Поддержка: Discord {SUPPORT_DISCORD}"),
+            lambda: ("If binds conflict with base hotkeys, bind is skipped." if self.i18n.lang == "en"
+                     else "Если бинд конфликтует с базовым хоткеем — он пропускается."),
+            lambda: ("Use Loop to run for N seconds (Repeat ignored)." if self.i18n.lang == "en"
+                     else "Loop запускает на N секунд (Repeat игнорируется)."),
+        ]
+        self._tip_i = 0
+
+        self.log_title = ctk.CTkLabel(self.page_record, text="Log", font=ctk.CTkFont(size=14, weight="bold"))
+        self.log_title.grid(row=1, column=0, columnspan=2, sticky="w", padx=16, pady=(6, 6))
 
         self.log_box = ctk.CTkTextbox(self.page_record, height=220, corner_radius=18)
         self.log_box.grid(row=2, column=0, columnspan=2, sticky="nsew", padx=16, pady=(0, 10))
+
+        self.btn_clear_log = ctk.CTkButton(self.page_record, text="Clear", command=self.clear_log_ui)
+        self.btn_clear_log.grid(row=3, column=0, columnspan=2, sticky="ew", padx=16, pady=(0, 16))
+
+        self.after(1200, self.update_tip_text)
+
+    def update_tip_text(self, force: bool = False):
+        if not self._tips:
+            return
+        if force:
+            self._tip_i = 0
+        try:
+            txt = self._tips[self._tip_i % len(self._tips)]()
+            self.tips_text.configure(text=txt)
+            self._tip_i += 1
+        except Exception:
+            pass
+        self.after(4500, self.update_tip_text)
+
+    def clear_log_ui(self):
+        try:
+            self.log_box.delete("1.0", "end")
+        except Exception:
+            pass
 
     def play_from_ui(self):
         s = self.current_play_settings()
@@ -1653,70 +1765,132 @@ class SaonixApp(ctk.CTk):
     def save_current_macro(self):
         name = self.save_name.get().strip()
         if not name:
-            messagebox.showwarning(self.i18n.t("dialogs_title"), self.i18n.t("save_name_warn"))
+            messagebox.showwarning(self.i18n.t("app_title"), self.i18n.t("save_name_warn"))
             return
         if not self.engine.events:
-            messagebox.showwarning(self.i18n.t("dialogs_title"), self.i18n.t("no_events_warn"))
+            messagebox.showwarning(self.i18n.t("app_title"), self.i18n.t("no_events_warn"))
             return
-
         if self.db.exists(name):
-            if not messagebox.askyesno(self.i18n.t("dialogs_title"), self.i18n.t("overwrite_q")):
+            if not messagebox.askyesno(self.i18n.t("app_title"), self.i18n.t("overwrite_q")):
                 return
 
         settings = self.current_play_settings()
         events = [asdict(e) for e in self.engine.events]
         self.db.put(name, events, settings)
-        self.logger.info(f"{self.i18n.t('saved')}: {name} (events: {len(events)})")
+        log.info(f"{self.i18n.t('saved')}: {name} (events: {len(events)})")
         self.refresh_library()
         self.show_page("library")
 
-    # ---- Library page ----
+    # ---------------------------
+    # Library page
+    # ---------------------------
     def build_library_page(self):
         self.page_library.grid_columnconfigure(0, weight=1)
         self.page_library.grid_columnconfigure(1, weight=2)
         self.page_library.grid_rowconfigure(0, weight=1)
 
-        left = ctk.CTkFrame(self.page_library, corner_radius=18)
-        left.grid(row=0, column=0, sticky="nsew", padx=(16, 10), pady=16)
-        left.grid_rowconfigure(3, weight=1)
-        left.grid_columnconfigure(0, weight=1)
+        self.lib_left = ctk.CTkFrame(self.page_library, corner_radius=18)
+        self.lib_left.grid(row=0, column=0, sticky="nsew", padx=(16, 10), pady=16)
+        self.lib_left.grid_rowconfigure(3, weight=1)
+        self.lib_left.grid_columnconfigure(0, weight=1)
+
+        self.lib_title = ctk.CTkLabel(self.lib_left, text="Library", font=ctk.CTkFont(size=16, weight="bold"))
+        self.lib_title.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="w")
 
         self.search_var = ctk.StringVar(value="")
-        self.search_entry = ctk.CTkEntry(left, textvariable=self.search_var, placeholder_text="")
-        self.search_entry.grid(row=1, column=0, padx=16, pady=(16, 10), sticky="ew")
+        self.search_entry = ctk.CTkEntry(self.lib_left, textvariable=self.search_var, placeholder_text="Search…")
+        self.search_entry.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="ew")
         self.search_entry.bind("<KeyRelease>", lambda e: self.refresh_library())
-        self.i_bind(self.search_entry, "placeholder", "search_ph")
 
-        self.macros_scroll = ctk.CTkScrollableFrame(left, corner_radius=14)
+        self.macros_scroll = ctk.CTkScrollableFrame(self.lib_left, corner_radius=14)
         self.macros_scroll.grid(row=3, column=0, padx=16, pady=(0, 10), sticky="nsew")
 
-        btns = ctk.CTkFrame(left, fg_color="transparent")
-        btns.grid(row=4, column=0, padx=16, pady=(0, 16), sticky="ew")
-        btns.grid_columnconfigure((0, 1), weight=1)
+        actions = ctk.CTkFrame(self.lib_left, fg_color="transparent")
+        actions.grid(row=4, column=0, padx=16, pady=(0, 16), sticky="ew")
+        actions.grid_columnconfigure((0, 1), weight=1)
 
-        self.btn_load = ctk.CTkButton(btns, text="", command=self.load_selected)
-        self.btn_delete = ctk.CTkButton(btns, text="", command=self.delete_selected)
+        self.btn_load = ctk.CTkButton(actions, text="Load", command=self.load_selected)
         self.btn_load.grid(row=0, column=0, padx=6, pady=6, sticky="ew")
+
+        self.btn_delete = ctk.CTkButton(actions, text="Delete", command=self.delete_selected)
         self.btn_delete.grid(row=0, column=1, padx=6, pady=6, sticky="ew")
-        self.i_bind(self.btn_load, "text", "btn_load")
-        self.i_bind(self.btn_delete, "text", "btn_delete")
 
-        right = ctk.CTkFrame(self.page_library, corner_radius=18)
-        right.grid(row=0, column=1, sticky="nsew", padx=(10, 16), pady=16)
-        right.grid_rowconfigure(3, weight=1)
-        right.grid_columnconfigure(0, weight=1)
+        actions2 = ctk.CTkFrame(self.lib_left, fg_color="transparent")
+        actions2.grid(row=5, column=0, padx=16, pady=(0, 16), sticky="ew")
+        actions2.grid_columnconfigure((0, 1), weight=1)
 
-        self.preview_title = ctk.CTkLabel(right, text="—", font=ctk.CTkFont(size=18, weight="bold"))
+        self.btn_rename = ctk.CTkButton(actions2, text="Rename", command=self.rename_selected)
+        self.btn_rename.grid(row=0, column=0, padx=6, pady=6, sticky="ew")
+
+        self.btn_clone = ctk.CTkButton(actions2, text="Clone", command=self.clone_selected)
+        self.btn_clone.grid(row=0, column=1, padx=6, pady=6, sticky="ew")
+
+        actions3 = ctk.CTkFrame(self.lib_left, fg_color="transparent")
+        actions3.grid(row=6, column=0, padx=16, pady=(0, 16), sticky="ew")
+        actions3.grid_columnconfigure((0, 1), weight=1)
+
+        self.btn_export = ctk.CTkButton(actions3, text="Export JSON", command=self.export_selected)
+        self.btn_export.grid(row=0, column=0, padx=6, pady=6, sticky="ew")
+
+        self.btn_import = ctk.CTkButton(actions3, text="Import JSON", command=self.import_macro)
+        self.btn_import.grid(row=0, column=1, padx=6, pady=6, sticky="ew")
+
+        # right
+        self.lib_right = ctk.CTkFrame(self.page_library, corner_radius=18)
+        self.lib_right.grid(row=0, column=1, sticky="nsew", padx=(10, 16), pady=16)
+        self.lib_right.grid_rowconfigure(4, weight=1)
+        self.lib_right.grid_columnconfigure(0, weight=1)
+
+        self.preview_title = ctk.CTkLabel(self.lib_right, text="—", font=ctk.CTkFont(size=18, weight="bold"))
         self.preview_title.grid(row=0, column=0, padx=16, pady=(16, 6), sticky="w")
 
-        self.preview_label = ctk.CTkLabel(right, text="", font=ctk.CTkFont(weight="bold"))
-        self.preview_label.grid(row=1, column=0, padx=16, pady=(0, 6), sticky="w")
-        self.i_bind(self.preview_label, "text", "preview")
+        self.preview_meta = ctk.CTkLabel(self.lib_right, text="—")
+        self.preview_meta.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="w")
 
-        self.preview_box = ctk.CTkTextbox(right, corner_radius=14)
-        self.preview_box.grid(row=3, column=0, padx=16, pady=(0, 16), sticky="nsew")
+        bind_row = ctk.CTkFrame(self.lib_right, fg_color="transparent")
+        bind_row.grid(row=2, column=0, padx=16, pady=(0, 10), sticky="ew")
+        bind_row.grid_columnconfigure(1, weight=1)
+
+        self.bind_label = ctk.CTkLabel(bind_row, text="Bind:", width=90, anchor="w")
+        self.bind_label.grid(row=0, column=0, sticky="w")
+
+        self.bind_var = ctk.StringVar(value="F6")
+        self.bind_entry = ctk.CTkEntry(bind_row, textvariable=self.bind_var, placeholder_text="F6 or Ctrl+Alt+F6")
+        self.bind_entry.grid(row=0, column=1, sticky="ew", padx=(10, 10))
+
+        self.btn_bind = ctk.CTkButton(bind_row, text="Set", width=110, command=self.bind_selected)
+        self.btn_bind.grid(row=0, column=2, sticky="e", padx=(0, 8))
+
+        self.btn_unbind = ctk.CTkButton(bind_row, text="Remove", width=90, command=self.unbind_selected)
+        self.btn_unbind.grid(row=0, column=3, sticky="e")
+
+        self.binds_box = ctk.CTkTextbox(self.lib_right, height=120, corner_radius=14)
+        self.binds_box.grid(row=3, column=0, padx=16, pady=(0, 10), sticky="nsew")
+
+        self.preview_box = ctk.CTkTextbox(self.lib_right, corner_radius=14)
+        self.preview_box.grid(row=4, column=0, padx=16, pady=(0, 10), sticky="nsew")
+
+        playbar = ctk.CTkFrame(self.lib_right, fg_color="transparent")
+        playbar.grid(row=5, column=0, padx=16, pady=(0, 16), sticky="ew")
+        playbar.grid_columnconfigure((0, 1), weight=1)
+
+        self.btn_play_sel = ctk.CTkButton(playbar, text="Play selected", command=self.play_selected)
+        self.btn_play_sel.grid(row=0, column=0, padx=6, sticky="ew")
+
+        self.btn_stop_sel = ctk.CTkButton(playbar, text="Stop", command=self.engine.stop_playing)
+        self.btn_stop_sel.grid(row=0, column=1, padx=6, sticky="ew")
 
         self.refresh_library()
+        self.refresh_binds_box()
+
+    def refresh_binds_box(self):
+        self.binds_box.delete("1.0", "end")
+        binds = self.db.binds()
+        if not binds:
+            self.binds_box.insert("end", self.i18n.t("binds_none") + "\n")
+            return
+        for hk, mn in sorted(binds.items(), key=lambda x: x[0]):
+            self.binds_box.insert("end", f"{hk}  ->  {mn}\n")
 
     def refresh_library(self):
         q = self.search_var.get().strip().lower()
@@ -1724,243 +1898,467 @@ class SaonixApp(ctk.CTk):
         for child in self.macros_scroll.winfo_children():
             try: child.destroy()
             except Exception: pass
+        self.macro_buttons.clear()
 
-        names = []
-        for n in self.db.names():
-            if q and q not in n.lower():
-                continue
-            names.append(n)
+        names = [n for n in self.db.names() if (not q or q in n.lower())]
 
         if not names:
-            ctk.CTkLabel(self.macros_scroll, text=self.i18n.t("empty")).pack(anchor="w", padx=8, pady=8)
+            empty = ctk.CTkLabel(self.macros_scroll, text=self.i18n.t("empty"))
+            empty.pack(anchor="w", padx=8, pady=8)
             self.selected_macro = None
-            self.preview_title.configure(text="—")
-            self.preview_box.delete("1.0", "end")
+            self.preview_clear()
             return
 
         if self.selected_macro not in names:
             self.selected_macro = names[0]
 
         for n in names:
-            btn = ctk.CTkButton(self.macros_scroll, text=n, anchor="w", corner_radius=12,
-                               command=lambda name=n: self.select_macro(name))
+            btn = ctk.CTkButton(self.macros_scroll, text=n, anchor="w",
+                                corner_radius=12, command=lambda name=n: self.select_macro(name))
             btn.pack(fill="x", padx=6, pady=6)
+            self.macro_buttons[n] = btn
 
+        self._restyle_macro_buttons()
         self.preview_selected()
+
+    def _restyle_macro_buttons(self):
+        s = style_get(self.current_style)
+        for name, btn in self.macro_buttons.items():
+            if name == self.selected_macro:
+                btn.configure(fg_color=s["panel"], hover_color=s["border"], text_color=s["text"],
+                              border_width=2, border_color=s["accent"])
+            else:
+                btn.configure(fg_color=s["card"], hover_color=s["border"], text_color=s["text"], border_width=0)
 
     def select_macro(self, name: str):
         self.selected_macro = name
+        self._restyle_macro_buttons()
         self.preview_selected()
+
+    def preview_clear(self):
+        self.preview_title.configure(text="—")
+        self.preview_meta.configure(text="—")
+        self.preview_box.delete("1.0", "end")
 
     def preview_selected(self):
         name = self.selected_macro
         if not name:
+            self.preview_clear()
             return
         item = self.db.get(name)
         if not item:
+            self.preview_clear()
             return
 
+        created = item.get("created", 0)
+        created_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(created)) if created else "—"
+        count = len(item.get("events", []))
+        st = item.get("settings", {})
+        if self.i18n.lang == "ru":
+            meta = f"Создан: {created_str} | Событий: {count} | repeat={st.get('repeat',1)} loop={st.get('loop_seconds',0)} speed={st.get('speed',1.0)}"
+        else:
+            meta = f"Created: {created_str} | Events: {count} | repeat={st.get('repeat',1)} loop={st.get('loop_seconds',0)} speed={st.get('speed',1.0)}"
+
         self.preview_title.configure(text=name)
+        self.preview_meta.configure(text=meta)
         self.preview_box.delete("1.0", "end")
-        self.preview_box.insert("end", json.dumps(item.get("settings", {}), ensure_ascii=False, indent=2))
+        self.preview_box.insert("end", json.dumps(st, ensure_ascii=False, indent=2))
 
     def load_selected(self):
         name = self.selected_macro
         if not name:
-            messagebox.showwarning(self.i18n.t("dialogs_title"), self.i18n.t("select_macro_warn"))
+            messagebox.showwarning(self.i18n.t("app_title"), self.i18n.t("select_macro_warn"))
+            return
+        item = self.db.get(name)
+        if not item:
+            return
+        self.engine.events = [Event(**e) for e in item.get("events", [])]
+        self.apply_play_settings_to_ui(item.get("settings", {}))
+        log.info(f"{self.i18n.t('loaded')}: {name} (events: {len(self.engine.events)})")
+        self.show_page("record")
+
+    def play_selected(self):
+        name = self.selected_macro
+        if not name:
+            messagebox.showwarning(self.i18n.t("app_title"), self.i18n.t("select_macro_warn"))
+            return
+        item = self.db.get(name)
+        if not item:
+            return
+        self.engine.events = [Event(**e) for e in item.get("events", [])]
+        self.apply_play_settings_to_ui(item.get("settings", {}))
+        s = self.current_play_settings()
+        self.engine.play(s["repeat"], s["loop_seconds"], s["speed"], s["start_delay"])
+
+    def delete_selected(self):
+        name = self.selected_macro
+        if not name:
+            messagebox.showwarning(self.i18n.t("app_title"), self.i18n.t("select_macro_warn"))
+            return
+        if not messagebox.askyesno(self.i18n.t("app_title"), self.i18n.t("delete_q") + f" '{name}'?"):
+            return
+        self.db.delete(name)
+        log.info(f"{self.i18n.t('deleted')}: {name}")
+        self.selected_macro = None
+        self.refresh_library()
+        self.refresh_binds_box()
+        self.rebuild_hotkeys()
+
+    def rename_selected(self):
+        old = self.selected_macro
+        if not old:
+            messagebox.showwarning(self.i18n.t("app_title"), self.i18n.t("select_macro_warn"))
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(self.i18n.t("btn_rename"))
+        dialog.geometry("420x180")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        frm = ctk.CTkFrame(dialog, corner_radius=18)
+        frm.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(frm, text=self.i18n.t("btn_rename"),
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=12, pady=(12, 6))
+        var = ctk.StringVar(value=old)
+        ent = ctk.CTkEntry(frm, textvariable=var)
+        ent.pack(fill="x", padx=12, pady=6)
+        ent.focus_set()
+
+        def do():
+            new = var.get().strip()
+            if not new or new == old:
+                dialog.destroy()
+                return
+            ok = self.db.rename(old, new)
+            if not ok:
+                messagebox.showerror(self.i18n.t("app_title"),
+                                     "Name exists." if self.i18n.lang == "en" else "Имя уже занято.")
+                return
+            log.info(f"{self.i18n.t('renamed')}: {old} -> {new}")
+            dialog.destroy()
+            self.selected_macro = new
+            self.refresh_library()
+            self.refresh_binds_box()
+            self.rebuild_hotkeys()
+
+        btns = ctk.CTkFrame(frm, fg_color="transparent")
+        btns.pack(fill="x", padx=12, pady=(10, 12))
+        ctk.CTkButton(btns, text="OK", command=do).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Cancel", command=dialog.destroy).pack(side="left", padx=6)
+
+    def clone_selected(self):
+        src = self.selected_macro
+        if not src:
+            messagebox.showwarning(self.i18n.t("app_title"), self.i18n.t("select_macro_warn"))
+            return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title(self.i18n.t("btn_clone"))
+        dialog.geometry("460x190")
+        dialog.resizable(False, False)
+        dialog.grab_set()
+
+        frm = ctk.CTkFrame(dialog, corner_radius=18)
+        frm.pack(fill="both", expand=True, padx=14, pady=14)
+
+        ctk.CTkLabel(frm, text=f"{self.i18n.t('btn_clone')}: {src}",
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=12, pady=(12, 6))
+        var = ctk.StringVar(value=f"{src} (copy)")
+        ent = ctk.CTkEntry(frm, textvariable=var)
+        ent.pack(fill="x", padx=12, pady=6)
+        ent.focus_set()
+
+        def do():
+            dst = var.get().strip()
+            if not dst:
+                return
+            ok = self.db.clone(src, dst)
+            if not ok:
+                messagebox.showerror(self.i18n.t("app_title"),
+                                     "Failed (name exists?)" if self.i18n.lang == "en" else "Ошибка (имя занято?)")
+                return
+            log.info(f"{self.i18n.t('cloned')}: {src} -> {dst}")
+            dialog.destroy()
+            self.selected_macro = dst
+            self.refresh_library()
+
+        btns = ctk.CTkFrame(frm, fg_color="transparent")
+        btns.pack(fill="x", padx=12, pady=(10, 12))
+        ctk.CTkButton(btns, text="OK", command=do).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Cancel", command=dialog.destroy).pack(side="left", padx=6)
+
+    def export_selected(self):
+        name = self.selected_macro
+        if not name:
+            messagebox.showwarning(self.i18n.t("app_title"), self.i18n.t("select_macro_warn"))
             return
         item = self.db.get(name)
         if not item:
             return
 
-        ev_raw = item.get("events", [])
-        events: List[Event] = []
-        for e in ev_raw:
-            try:
-                events.append(Event(**e))
-            except Exception:
-                pass
-        self.engine.events = events
+        default_name = f"{name}.json"
+        path = filedialog.asksaveasfilename(
+            title=self.i18n.t("btn_export"),
+            defaultextension=".json",
+            initialfile=default_name,
+            filetypes=[("JSON", "*.json")]
+        )
+        if not path:
+            return
 
-        s = item.get("settings", {})
-        self.repeat_var.set(str(s.get("repeat", 1)))
-        self.loop_var.set(str(s.get("loop_seconds", 0)))
-        self.speed_var.set(str(s.get("speed", 1.0)))
-        self.delay_var.set(str(s.get("start_delay", 0.0)))
+        try:
+            payload = {
+                "format": "saonix_macro_v1",
+                "name": name,
+                "created": item.get("created", int(time.time())),
+                "settings": item.get("settings", {}),
+                "events": item.get("events", []),
+            }
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+            log.info(f"{self.i18n.t('exported')}: {name} -> {path}")
+        except Exception as e:
+            log.error(f"Export error: {e}")
+            messagebox.showerror(self.i18n.t("app_title"), f"Error: {e}")
 
-        self.logger.info(f"{self.i18n.t('loaded')}: {name} (events: {len(self.engine.events)})")
-        self.show_page("record")
+    def import_macro(self):
+        path = filedialog.askopenfilename(title=self.i18n.t("btn_import"), filetypes=[("JSON", "*.json")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict) or "events" not in payload:
+                raise ValueError("Invalid file")
 
-    def delete_selected(self):
+            name = str(payload.get("name", os.path.splitext(os.path.basename(path))[0])).strip() or "Imported macro"
+            if self.db.exists(name):
+                base = name
+                i = 2
+                while self.db.exists(f"{base} ({i})"):
+                    i += 1
+                name = f"{base} ({i})"
+
+            settings = payload.get("settings", {})
+            events = payload.get("events", [])
+
+            ev_objs: List[Event] = []
+            for e in events:
+                if not isinstance(e, dict):
+                    continue
+                if not all(k in e for k in ("t", "device", "type", "data")):
+                    continue
+                ev_objs.append(Event(
+                    t=float(e["t"]),
+                    device=str(e["device"]),
+                    type=str(e["type"]),
+                    data=dict(e["data"]) if isinstance(e["data"], dict) else {}
+                ))
+
+            self.db.put(name, [asdict(x) for x in ev_objs], settings if isinstance(settings, dict) else {})
+            log.info(f"{self.i18n.t('imported')}: {name} (events: {len(ev_objs)})")
+            self.selected_macro = name
+            self.refresh_library()
+        except Exception as e:
+            log.error(f"Import error: {e}")
+            log.error(traceback.format_exc())
+            messagebox.showerror(self.i18n.t("app_title"), f"Error: {e}")
+
+    def bind_selected(self):
         name = self.selected_macro
         if not name:
-            messagebox.showwarning(self.i18n.t("dialogs_title"), self.i18n.t("select_macro_warn"))
+            messagebox.showwarning(self.i18n.t("app_title"), self.i18n.t("select_macro_warn"))
             return
-        if not messagebox.askyesno(self.i18n.t("dialogs_title"), self.i18n.t("delete_q")):
+        hk_raw = self.bind_var.get()
+        hk = normalize_hotkey(hk_raw)
+        if not hk:
+            messagebox.showerror(self.i18n.t("app_title"), self.i18n.t("invalid_hotkey"))
             return
-        self.db.delete(name)
-        self.logger.info(f"{self.i18n.t('deleted')}: {name}")
-        self.selected_macro = None
-        self.refresh_library()
 
-    # ---- Settings page ----
+        binds = self.db.binds()
+        if hk in binds and binds[hk] != name:
+            if not messagebox.askyesno(self.i18n.t("app_title"),
+                                       f"{hk} already bound to '{binds[hk]}'. Override?"):
+                return
+
+        self.db.set_bind(hk, name)
+        log.info(f"Bind: {hk} -> {name}")
+        self.refresh_binds_box()
+        self.rebuild_hotkeys()
+
+    def unbind_selected(self):
+        hk_raw = self.bind_var.get()
+        hk = normalize_hotkey(hk_raw)
+        if not hk:
+            messagebox.showerror(self.i18n.t("app_title"), self.i18n.t("invalid_hotkey"))
+            return
+        self.db.remove_bind(hk)
+        log.info(f"Unbound: {hk}")
+        self.refresh_binds_box()
+        self.rebuild_hotkeys()
+
+    # ---------------------------
+    # Settings page
+    # ---------------------------
     def build_settings_page(self):
-        wrap = ctk.CTkFrame(self.page_settings, corner_radius=18)
-        wrap.pack(fill="both", expand=True, padx=16, pady=16)
-        wrap.grid_columnconfigure(1, weight=1)
+        self.page_settings.grid_columnconfigure(0, weight=1)
+        self.page_settings.grid_rowconfigure(0, weight=1)
 
-        self.lbl_playback = ctk.CTkLabel(wrap, text="", font=ctk.CTkFont(weight="bold"))
-        self.lbl_playback.grid(row=0, column=0, columnspan=2, padx=14, pady=(10, 6), sticky="w")
-        self.i_bind(self.lbl_playback, "text", "playback")
+        self.set_wrap = ctk.CTkFrame(self.page_settings, corner_radius=18)
+        self.set_wrap.grid(row=0, column=0, sticky="nsew", padx=16, pady=16)
+        self.set_wrap.grid_columnconfigure(0, weight=1)
 
-        def row(r: int, label_key: str, var: ctk.StringVar, ph: str):
-            lab = ctk.CTkLabel(wrap, text="")
-            ent = ctk.CTkEntry(wrap, textvariable=var, placeholder_text=ph)
-            lab.grid(row=r, column=0, padx=14, pady=10, sticky="w")
-            ent.grid(row=r, column=1, padx=14, pady=10, sticky="ew")
-            self.i_bind(lab, "text", label_key)
+        self.set_title = ctk.CTkLabel(self.set_wrap, text="Playback", font=ctk.CTkFont(size=18, weight="bold"))
+        self.set_title.grid(row=0, column=0, padx=16, pady=(16, 8), sticky="w")
 
-        row(1, "repeat", self.repeat_var, "e.g. 5")
-        row(2, "loop", self.loop_var, "e.g. 60")
-        row(3, "speed", self.speed_var, "0.5 / 1.0 / 2.0")
-        row(4, "delay", self.delay_var, "e.g. 3")
+        self.set_labels: List[ctk.CTkLabel] = []
+        self.set_entries: List[ctk.CTkEntry] = []
 
-        self.lbl_hotkeys = ctk.CTkLabel(wrap, text="", font=ctk.CTkFont(weight="bold"))
-        self.lbl_hotkeys.grid(row=5, column=0, columnspan=2, padx=14, pady=(18, 6), sticky="w")
-        self.i_bind(self.lbl_hotkeys, "text", "hotkeys")
+        def add_row(r: int, label: str, var: ctk.StringVar, placeholder: str):
+            row = ctk.CTkFrame(self.set_wrap, fg_color="transparent")
+            row.grid(row=r, column=0, padx=16, pady=8, sticky="ew")
+            row.grid_columnconfigure(1, weight=1)
 
-        def hkrow(r: int, label_key: str, var: ctk.StringVar, ph: str):
-            lab = ctk.CTkLabel(wrap, text="")
-            ent = ctk.CTkEntry(wrap, textvariable=var, placeholder_text=ph)
-            lab.grid(row=r, column=0, padx=14, pady=10, sticky="w")
-            ent.grid(row=r, column=1, padx=14, pady=10, sticky="ew")
-            self.i_bind(lab, "text", label_key)
+            lab = ctk.CTkLabel(row, text=label, width=200, anchor="w")
+            lab.grid(row=0, column=0, sticky="w")
 
-        hkrow(6, "hk_rec", self.hk_rec_var, "Ctrl+Alt+1")
-        hkrow(7, "hk_stoprec", self.hk_stoprec_var, "Ctrl+Alt+2")
-        hkrow(8, "hk_play", self.hk_play_var, "Ctrl+Alt+3")
-        hkrow(9, "hk_stop", self.hk_stop_var, "Ctrl+Alt+4")
+            ent = ctk.CTkEntry(row, textvariable=var, placeholder_text=placeholder)
+            ent.grid(row=0, column=1, sticky="ew", padx=(10, 0))
 
-        bar = ctk.CTkFrame(wrap, fg_color="transparent")
-        bar.grid(row=10, column=0, columnspan=2, padx=14, pady=(12, 0), sticky="ew")
+            self.set_labels.append(lab)
+            self.set_entries.append(ent)
 
-        self.btn_apply = ctk.CTkButton(bar, text="", command=self.apply_settings)
-        self.btn_hk_apply = ctk.CTkButton(bar, text="", command=self.apply_hotkeys)
+        add_row(1, "Repeat", self.repeat_var, "e.g. 5")
+        add_row(2, "Loop", self.loop_var, "e.g. 7200")
+        add_row(3, "Speed", self.speed_var, "0.5 / 1.0 / 2.0")
+        add_row(4, "Delay", self.delay_var, "e.g. 3")
+
+        self.set_hint = ctk.CTkLabel(self.set_wrap, text="If Loop > 0, Repeat is ignored.", anchor="w")
+        self.set_hint.grid(row=5, column=0, padx=16, pady=(4, 12), sticky="w")
+
+        # base hotkeys
+        self.hk_title = ctk.CTkLabel(self.set_wrap, text="Base hotkeys", font=ctk.CTkFont(weight="bold"))
+        self.hk_title.grid(row=6, column=0, padx=16, pady=(10, 6), sticky="w")
+
+        self.hk_labels: List[ctk.CTkLabel] = []
+        self.hk_entries: List[ctk.CTkEntry] = []
+
+        def hk_row(r: int, label: str, var: ctk.StringVar):
+            row = ctk.CTkFrame(self.set_wrap, fg_color="transparent")
+            row.grid(row=r, column=0, padx=16, pady=6, sticky="ew")
+            row.grid_columnconfigure(1, weight=1)
+
+            lab = ctk.CTkLabel(row, text=label, width=200, anchor="w")
+            lab.grid(row=0, column=0, sticky="w")
+            ent = ctk.CTkEntry(row, textvariable=var, placeholder_text="e.g. Ctrl+Alt+1 or F6")
+            ent.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+
+            self.hk_labels.append(lab)
+            self.hk_entries.append(ent)
+
+        hk_row(7, "Start record", self.hk_rec_var)
+        hk_row(8, "Stop record", self.hk_stoprec_var)
+        hk_row(9, "Play loaded", self.hk_play_var)
+        hk_row(10, "Stop playing", self.hk_stop_var)
+
+        btns = ctk.CTkFrame(self.set_wrap, fg_color="transparent")
+        btns.grid(row=11, column=0, padx=16, pady=(10, 16), sticky="w")
+
+        self.btn_apply = ctk.CTkButton(btns, text="Apply", command=self.apply_settings)
         self.btn_apply.pack(side="left", padx=6)
-        self.btn_hk_apply.pack(side="left", padx=6)
-        self.i_bind(self.btn_apply, "text", "apply")
-        self.i_bind(self.btn_hk_apply, "text", "hk_apply")
 
-        self.ver_lbl = ctk.CTkLabel(wrap, text="")
-        self.ver_lbl.grid(row=11, column=0, columnspan=2, padx=14, pady=(18, 6), sticky="w")
+        self.btn_reset = ctk.CTkButton(btns, text="Reset", command=self.reset_settings)
+        self.btn_reset.pack(side="left", padx=6)
 
-        self.support2 = ctk.CTkLabel(wrap, text="", wraplength=900, justify="left")
-        self.support2.grid(row=12, column=0, columnspan=2, padx=14, pady=(0, 10), sticky="w")
-        self.i_bind(self.support2, "text", "support")
+        self.btn_apply_hotkeys = ctk.CTkButton(btns, text="Apply hotkeys", command=self.apply_hotkeys_from_ui)
+        self.btn_apply_hotkeys.pack(side="left", padx=6)
 
-        self.refresh_version_line()
-
-    def refresh_version_line(self):
-        info = self.boot_info
-        line = f"{self.i18n.t('version_line')}: {APP_VERSION}"
-        if info.get("remote"):
-            line += f" | {self.i18n.t('remote_line')}: {info['remote']}"
-            if info.get("update"):
-                line += f" — {self.i18n.t('update_available')}"
-        self.ver_lbl.configure(text=line)
+    def reset_settings(self):
+        self.repeat_var.set("1")
+        self.loop_var.set("0")
+        self.speed_var.set("1.0")
+        self.delay_var.set("0")
+        self.apply_settings()
+        log.info("Settings reset.")
 
     def apply_settings(self):
+        # apply + persist only (engine reads from UI at play time)
         self.persist_settings()
-        self.refresh_version_line()
-        self.logger.info("Settings saved")
+        s = self.current_play_settings()
+        log.info(f"Applied: repeat={s['repeat']} loop={s['loop_seconds']} speed={s['speed']} delay={s['start_delay']}")
 
-    def apply_hotkeys(self):
+    def apply_hotkeys_from_ui(self):
+        hk_rec = normalize_hotkey(self.hk_rec_var.get())
+        hk_stoprec = normalize_hotkey(self.hk_stoprec_var.get())
+        hk_play = normalize_hotkey(self.hk_play_var.get())
+        hk_stop = normalize_hotkey(self.hk_stop_var.get())
+
+        if not all([hk_rec, hk_stoprec, hk_play, hk_stop]):
+            messagebox.showerror(self.i18n.t("app_title"), self.i18n.t("invalid_hotkey"))
+            return
+
         self.persist_settings()
         self.rebuild_hotkeys()
-        self.logger.info("Hotkeys updated")
+        log.info("Base hotkeys updated.")
 
+    # ---------------------------
+    # Hotkeys rebuild (base + binds)
+    # ---------------------------
     def rebuild_hotkeys(self):
         def hk_norm(raw: str, fallback: str) -> str:
             v = normalize_hotkey(raw)
             return v if v else (normalize_hotkey(fallback) or "<f6>")
 
-        mapping = {
+        base = {
             hk_norm(self.hk_rec_var.get(), "Ctrl+Alt+1"): self.engine.start_recording,
             hk_norm(self.hk_stoprec_var.get(), "Ctrl+Alt+2"): self.engine.stop_recording,
             hk_norm(self.hk_play_var.get(), "Ctrl+Alt+3"): self.play_from_ui,
             hk_norm(self.hk_stop_var.get(), "Ctrl+Alt+4"): self.engine.stop_playing,
         }
-        self.hk.set(mapping)
+
+        binds = self.db.binds()
+        for hk, macro_name in binds.items():
+            if hk in base:
+                log.warn(f"Bind conflicts with base hotkey: {hk} (skipped)")
+                continue
+
+            def make_play(name=macro_name):
+                def _f():
+                    item = self.db.get(name)
+                    if not item:
+                        log.warn(f"[bind] macro not found: {name}")
+                        return
+                    self.engine.events = [Event(**e) for e in item.get("events", [])]
+                    self.apply_play_settings_to_ui(item.get("settings", {}))
+                    s = self.current_play_settings()
+                    self.engine.play(s["repeat"], s["loop_seconds"], s["speed"], s["start_delay"])
+                    log.info(f"[bind] play: {name}")
+                return _f
+
+            base[hk] = make_play()
+
+        self.hk.set(base)
 
 
-# =============================
-# Bootstrap
-# =============================
+# ============================================================
+# Run app
+# ============================================================
+
+def run_app():
+    app = SaonixApp()
+    app.mainloop()
+
+
+# ============================================================
+# Main entry: show loader first
+# ============================================================
+
 def main():
-    splash = None
-    root = None
-    try:
-        # load db settings for language
-        db = MacroDB(DB_FILE)
-        saved = db.get_settings()
-        lang = saved.get("lang", "auto")
-
-        i18n = I18N(lang)
-
-        # hidden root for splash
-        ctk.set_default_color_theme(saved.get("color_theme", "dark-blue"))
-        root = ctk.CTk()
-        root.withdraw()
-
-        # ensure icon (cached, no repeat download if not changed)
-        if not os.path.exists(ICON_PNG):
-            ensure_icon_png()
-
-        splash = Splash(master=root, i18n=i18n, png_path=ICON_PNG)
-
-        def setp(step_key: str, frac: float):
-            if not splash:
-                return
-            splash.set_status(i18n.t(step_key), frac)
-
-        # version check
-        setp("loader_step_version", 0.18)
-        boot_info = check_remote_version(progress=lambda f: setp("loader_step_version", f))
-
-        # icon check/download with ETag
-        setp("loader_step_icon", 0.50)
-        ensure_icon_png(progress=lambda f: setp("loader_step_icon", f))
-
-        setp("loader_step_ready", 0.92)
-
-        app = SaonixApp(i18n=i18n, boot_info=boot_info)
-
-        splash.close()
-        splash = None
-        try:
-            root.destroy()
-        except Exception:
-            pass
-
-        app.mainloop()
-
-    except Exception as e:
-        try:
-            with open(CRASH_FILE, "w", encoding="utf-8") as f:
-                f.write(str(e) + "\n\n" + traceback.format_exc())
-        except Exception:
-            pass
-        try:
-            if splash:
-                splash.close()
-        except Exception:
-            pass
-        try:
-            if root:
-                root.destroy()
-        except Exception:
-            pass
-
+    # loader first; then app
+    l = Loader()
+    l.mainloop()
 
 if __name__ == "__main__":
     main()
