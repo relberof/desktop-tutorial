@@ -657,6 +657,8 @@ class MacroEngine:
                 return
             if self.recording:
                 return
+            # Release any stuck modifiers before starting
+            self.release_all_modifiers()
             self.events = []
             self._t0 = self.now()
             self.recording = True
@@ -666,6 +668,7 @@ class MacroEngine:
         if not self.recording:
             return
         self.recording = False
+        self.release_all_modifiers()
         self.log.info(f"=== Recording stopped. Events: {len(self.events)} ===")
 
     def stop_playing(self):
@@ -674,7 +677,17 @@ class MacroEngine:
                 return
             self._stop_play.set()
             self.playing = False
+            self.release_all_modifiers()
             self.log.info("=== Stopped ===")
+
+    def release_all_modifiers(self):
+        """Принудительно отпускает все клавиши-модификаторы (Win, Ctrl, Alt, Shift)."""
+        for key in [Key.ctrl_l, Key.ctrl_r, Key.alt_l, Key.alt_r,
+                    Key.shift_l, Key.shift_r, Key.cmd, Key.cmd_r]:
+            try:
+                self.kb_ctl.release(key)
+            except Exception:
+                pass
 
     def _key_to_repr(self, k):
         if isinstance(k, Key):
@@ -818,6 +831,8 @@ class MacroEngine:
                     with self._play_lock:
                         self.playing = False
                         self._stop_play.set()
+                    # IMPORTANT: release all modifiers after playback finishes or is interrupted
+                    self.release_all_modifiers()
 
             threading.Thread(target=run, daemon=True).start()
 
@@ -1360,6 +1375,10 @@ class SaonixApp(ctk.CTk):
         except Exception:
             pass
         try:
+            self.engine.release_all_modifiers()
+        except Exception:
+            pass
+        try:
             self.engine.shutdown()
         except Exception:
             pass
@@ -1660,7 +1679,13 @@ class SaonixApp(ctk.CTk):
             self.page_settings.grid()
             self.h_title.configure(text=self.i18n.t("page_settings"))
 
-        self.apply_style()
+        # Remove full style refresh to speed up tab switching
+        # Only update navigation button styles (already done by apply_style elsewhere)
+        # But we need to ensure the active button is highlighted
+        s = style_get(self.current_style)
+        self._style_nav_button(self.btn_record, self._active_page == "record")
+        self._style_nav_button(self.btn_library, self._active_page == "library")
+        self._style_nav_button(self.btn_settings, self._active_page == "settings")
 
     # ---------------------------
     # Record page + tips panel
@@ -2356,7 +2381,7 @@ def run_app():
 # ============================================================
 
 def main():
-    # loader first; then app
+    # loader first; then app gfgd
     l = Loader()
     l.mainloop()
 
